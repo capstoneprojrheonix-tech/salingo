@@ -11,12 +11,8 @@
  */
 
 // TODO: point this to wherever you deploy the Python service.
-define('SALINGO_API_BASE', 'http://your-python-host:8000');
-
-// TODO: if you put the service behind auth (recommended), set a shared
-// secret here and check it in the FastAPI app.
-define('SALINGO_API_TIMEOUT', 60);
-
+define('SALINGO_API_BASE', 'https://salingo-api.onrender.com');
+define('SALINGO_API_TIMEOUT', 90);
 
 /**
  * Trains (adds to the translation memory) a language using an uploaded

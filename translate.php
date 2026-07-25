@@ -1,9 +1,18 @@
+<?php
+session_start();
+include("db.php");
+
+
+$SALINGO_API_BASE = "https://salingo-api.onrender.com";
+
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>SALINGO — Translation Engine Test</title>
+<title>SALINGO — Translate</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
   :root {
     --bg: #0E1422;
@@ -18,18 +27,18 @@
   * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', sans-serif; }
   body { background: var(--bg); color: var(--text); min-height: 100vh; padding: 40px 20px; }
   .wrap { max-width: 960px; margin: 0 auto; }
-  header { margin-bottom: 32px; }
+  header { margin-bottom: 32px; display: flex; align-items: center; justify-content: space-between; }
   header .eyebrow { color: var(--gold); letter-spacing: 3px; font-size: 12px; text-transform: uppercase; }
   header h1 { font-size: 28px; margin-top: 6px; }
   header p { color: var(--text-dim); margin-top: 6px; font-size: 14px; }
+  .back-link { color: var(--text-dim); text-decoration: none; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
+  .back-link:hover { color: var(--gold); }
 
-  .config {
+  .status-bar {
     display: flex; gap: 10px; align-items: center; margin-bottom: 28px;
     background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px;
-    padding: 12px 16px;
+    padding: 12px 16px; font-size: 13px; color: var(--text-dim);
   }
-  .config label { font-size: 13px; color: var(--text-dim); white-space: nowrap; }
-  .config input { flex: 1; }
 
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
   @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
@@ -84,16 +93,17 @@
 <body>
 <div class="wrap">
   <header>
-    <div class="eyebrow">SALINGO · Internal Tool</div>
-    <h1>Translation Engine Test Bench</h1>
-    <p>Test if the LangChain + RAG translation pipeline actually works, and train new languages directly.</p>
+    <div>
+      <div class="eyebrow">SALINGO</div>
+      <h1>Translate</h1>
+      <p>Powered by the SALINGO translation memory service.</p>
+    </div>
+    <a class="back-link" href="languageManagement.php"><i class="fa-solid fa-arrow-left"></i> Back to Language Management</a>
   </header>
 
-  <div class="config">
-    <label for="apiBase">Service URL</label>
-    <input type="text" id="apiBase" value="http://your-python-host:8000" />
-    <button class="primary" style="width:auto; margin:0; padding:8px 16px;" onclick="checkHealth()">Check</button>
-    <span id="healthStatus" class="meta"></span>
+  <div class="status-bar">
+    <span>Service status:</span>
+    <span id="healthStatus">checking...</span>
   </div>
 
   <div class="grid">
@@ -142,11 +152,10 @@
 </div>
 
 <script>
-let direction = 'to_english';
+// Hardcoded from the PHP side — no user input needed.
+const API_BASE = <?php echo json_encode(rtrim($SALINGO_API_BASE, '/')); ?>;
 
-function base() {
-  return document.getElementById('apiBase').value.replace(/\/$/, '');
-}
+let direction = 'to_english';
 
 function setDirection(d) {
   direction = d;
@@ -163,7 +172,7 @@ async function checkHealth() {
   const el = document.getElementById('healthStatus');
   el.innerText = 'checking...';
   try {
-    const res = await fetch(base() + '/health');
+    const res = await fetch(API_BASE + '/health');
     if (res.ok) {
       el.innerText = '● online';
       el.style.color = '#3ddc84';
@@ -173,7 +182,7 @@ async function checkHealth() {
       el.style.color = '#ff5d5d';
     }
   } catch (e) {
-    el.innerText = '● unreachable';
+    el.innerText = '● unreachable (service may be waking up, try again in a moment)';
     el.style.color = '#ff5d5d';
   }
 }
@@ -181,7 +190,7 @@ async function checkHealth() {
 async function loadTrainedLanguages() {
   const container = document.getElementById('trainedChips');
   try {
-    const res = await fetch(base() + '/languages');
+    const res = await fetch(API_BASE + '/languages');
     const data = await res.json();
     const langs = data.trained_languages || [];
     container.innerHTML = langs.length
@@ -209,10 +218,10 @@ async function doTranslate() {
   btn.innerText = 'Translating...';
   resultEl.style.display = 'block';
   resultEl.className = 'result';
-  resultEl.innerText = '...';
+  resultEl.innerText = 'Translating (this may take up to a minute if the service was asleep)...';
 
   try {
-    const res = await fetch(base() + '/translate', {
+    const res = await fetch(API_BASE + '/translate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text, language: lang, direction })
@@ -227,7 +236,7 @@ async function doTranslate() {
       resultEl.innerText = data.translation;
       const meta = document.createElement('div');
       meta.className = 'meta';
-      meta.innerText = `Examples used from translation memory: ${data.examples_used} · Trained: ${data.trained ? 'yes' : 'no (using base Gemini knowledge)'}`;
+      meta.innerText = `Examples used from translation memory: ${data.examples_used} · Trained: ${data.trained ? 'yes' : 'no (using base model knowledge)'}`;
       resultEl.appendChild(meta);
     }
   } catch (e) {
@@ -263,7 +272,7 @@ async function doTrain() {
   form.append('file', file);
 
   try {
-    const res = await fetch(base() + '/train', { method: 'POST', body: form });
+    const res = await fetch(API_BASE + '/train', { method: 'POST', body: form });
     const data = await res.json();
 
     if (!res.ok) {

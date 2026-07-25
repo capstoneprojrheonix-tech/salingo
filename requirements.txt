@@ -4,5 +4,6 @@ python-multipart
 google-genai
 pypdf
 pandas
+openpyxl
 numpy
 python-dotenv
