@@ -108,6 +108,32 @@ def train(
     return result
 
 
+@app.post("/translate-audio")
+def translate_audio(
+    source_language: str = Form(...),
+    target_language: str = Form(...),
+    audio: UploadFile = File(...),
+):
+    mime_type = audio.content_type or "audio/webm"
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    tmp_path = tmp_dir / (audio.filename or "recording.webm")
+    try:
+        with open(tmp_path, "wb") as f:
+            shutil.copyfileobj(audio.file, f)
+
+        try:
+            result = agent.transcribe_and_translate_audio(
+                str(tmp_path), mime_type, source_language, target_language
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Audio translation failed: {e}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return result
+
+
 @app.delete("/languages")
 def delete_language_pair(language: str, target_language: str = "English"):
     deleted = agent.delete_language_pair(language, target_language)
