@@ -373,3 +373,70 @@ def translate_text(
         "examples_used": len(examples),
         "trained": trained,
     }
+
+
+# ---------------------------------------------------------------------
+# Speech-to-text (transcription) + translation
+# ---------------------------------------------------------------------
+
+def _transcribe_audio(file_path: str, mime_type: str, spoken_language: str) -> str:
+    """
+    Transcribe a short audio clip using Gemini's audio understanding.
+    Works for any language the model has been told to expect, including
+    languages with no dedicated browser speech-recognition support
+    (e.g. Kapampangan).
+    """
+    with open(file_path, "rb") as f:
+        audio_bytes = f.read()
+
+    client = get_client()
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=[
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+            (
+                f"Transcribe the speech in this audio clip. The speaker is speaking "
+                f"in '{spoken_language}'. Respond with ONLY the verbatim transcript in "
+                f"'{spoken_language}' — no translation, no explanations, no quotes, no "
+                "extra commentary. If the audio is silent or unintelligible, respond "
+                "with an empty string."
+            ),
+        ],
+        config=types.GenerateContentConfig(temperature=0.0),
+    )
+
+    return (response.text or "").strip()
+
+
+def transcribe_and_translate_audio(
+    file_path: str,
+    mime_type: str,
+    source_language: str,
+    target_language: str,
+) -> dict:
+    """
+    Transcribe spoken audio in `source_language`, then translate the
+    transcript into `target_language` using the same translation-memory
+    pipeline as translate_text().
+
+    Returns: {"transcript": str, "translation": str, "examples_used": int, "trained": bool}
+    """
+    transcript = _transcribe_audio(file_path, mime_type, source_language)
+
+    if not transcript:
+        return {
+            "transcript": "",
+            "translation": "",
+            "examples_used": 0,
+            "trained": False,
+            "message": "Could not make out any speech in the recording. Please try again.",
+        }
+
+    result = translate_text(transcript, source_language, target_language)
+
+    return {
+        "transcript": transcript,
+        "translation": result["translation"],
+        "examples_used": result["examples_used"],
+        "trained": result["trained"],
+    }
