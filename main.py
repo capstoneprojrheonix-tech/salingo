@@ -88,7 +88,7 @@ def train(
     target_language: str = Form("English"),
     file: UploadFile = File(...),
 ):
-    allowed_ext = (".csv", ".xlsx", ".xlsm", ".pdf")
+    allowed_ext = (".csv", ".xlsx", ".xlsm", ".pdf", ".txt")
     if not file.filename.lower().endswith(allowed_ext):
         raise HTTPException(400, f"Only {', '.join(allowed_ext)} files are supported")
 
