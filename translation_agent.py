@@ -24,6 +24,7 @@ import re
 import json
 import shutil
 import uuid
+import itertools
 from pathlib import Path
 from typing import Optional
 
@@ -85,68 +86,79 @@ def _info_file(store_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------
-# Parsing: CSV / XLSX (tabular, two language columns)
+# Parsing: CSV / XLSX (tabular — ANY number of language columns)
 # ---------------------------------------------------------------------
+# Instead of only reading two fixed columns, every column that doesn't
+# look like an ID/index column is treated as a language column (using its
+# header as the language name), and a training pair is built for every
+# 2-column combination found — e.g. a sheet with English, Tagalog, and
+# Kapampangan columns yields English↔Tagalog, English↔Kapampangan, and
+# Tagalog↔Kapampangan pairs, all from a single upload.
 
-def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, str]:
-    cols = [str(c).strip().lower() for c in df.columns]
-    df.columns = cols
-
-    a_col = lang_a.strip().lower() if lang_a.strip().lower() in cols else None
-    b_col = lang_b.strip().lower() if lang_b.strip().lower() in cols else None
-
-    # Backward-compatible fallback for the old "english"/"en" convention.
-    if b_col is None and lang_b.strip().lower() == "english":
-        b_col = next((c for c in ("english", "en") if c in cols), None)
-    if a_col is None and lang_a.strip().lower() == "english":
-        a_col = next((c for c in ("english", "en") if c in cols), None)
-
-    if a_col is None or b_col is None:
-        if len(cols) < 2:
-            raise ValueError(f"File must have at least 2 columns, got: {df.columns.tolist()}")
-        a_col = a_col or cols[0]
-        b_col = b_col or cols[1]
-
-    return a_col, b_col
+_ID_COLUMN_NAME_RE = re.compile(r"^(id|no\.?|num(ber)?|#|index|row)$", re.IGNORECASE)
 
 
-def _pairs_from_dataframe(df: pd.DataFrame, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+def _is_id_like_column(col_name, series: pd.Series) -> bool:
+    if _ID_COLUMN_NAME_RE.match(str(col_name).strip()):
+        return True
+
+    values = [str(v).strip() for v in series if str(v).strip() and str(v).strip().lower() != "nan"]
+    if not values:
+        return True  # fully empty column — not usable as a language column
+
+    # If every non-empty value is a plain integer, it's almost certainly an
+    # auto-numbered index column, not translated text.
+    return all(v.lstrip("-").isdigit() for v in values)
+
+
+def _detect_language_columns(df: pd.DataFrame) -> list:
+    return [col for col in df.columns if not _is_id_like_column(col, df[col])]
+
+
+def _all_pairs_from_dataframe(df: pd.DataFrame) -> dict[tuple[str, str], list[tuple[str, str]]]:
+    """
+    Returns {(lang_x, lang_y): [(text_x, text_y), ...]} for every pairwise
+    combination of detected language columns, using the original column
+    headers (trimmed) as the language names.
+    """
     if df.empty:
-        return []
-    a_col, b_col = _detect_columns(df, lang_a, lang_b)
+        return {}
 
-    pairs = []
-    for _, row in df.iterrows():
-        a_text = str(row.get(a_col, "")).strip()
-        b_text = str(row.get(b_col, "")).strip()
-        if a_text and b_text and a_text.lower() != "nan" and b_text.lower() != "nan":
-            pairs.append((a_text, b_text))
-    return pairs
+    lang_cols = _detect_language_columns(df)
+    if len(lang_cols) < 2:
+        return {}
+
+    result: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for col_x, col_y in itertools.combinations(lang_cols, 2):
+        pairs = []
+        for _, row in df.iterrows():
+            x_text = str(row.get(col_x, "")).strip()
+            y_text = str(row.get(col_y, "")).strip()
+            if x_text and y_text and x_text.lower() != "nan" and y_text.lower() != "nan":
+                pairs.append((x_text, y_text))
+        if pairs:
+            result[(str(col_x).strip(), str(col_y).strip())] = pairs
+    return result
 
 
-def _pairs_from_csv(csv_path: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+def _all_pairs_from_csv(csv_path: str) -> dict[tuple[str, str], list[tuple[str, str]]]:
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    return _pairs_from_dataframe(df, lang_a, lang_b)
+    return _all_pairs_from_dataframe(df)
 
 
-def _pairs_from_xlsx(xlsx_path: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+def _all_pairs_from_xlsx(xlsx_path: str) -> dict[tuple[str, str], list[tuple[str, str]]]:
     # sheet_name=None loads every sheet as {sheet_name: DataFrame}, instead
     # of silently defaulting to just the first sheet — some exports (e.g.
     # FAQ workbooks) split content across multiple sheets like
     # "Questions" / "Answers".
     sheets = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl", sheet_name=None)
 
-    all_pairs: list[tuple[str, str]] = []
+    combined: dict[tuple[str, str], list[tuple[str, str]]] = {}
     for sheet_df in sheets.values():
         sheet_df = sheet_df.fillna("")
-        try:
-            all_pairs.extend(_pairs_from_dataframe(sheet_df, lang_a, lang_b))
-        except ValueError:
-            # This sheet doesn't have the columns we need (e.g. fewer than
-            # 2 columns, or an unrelated summary sheet) — skip it instead
-            # of failing the whole file.
-            continue
-    return all_pairs
+        for combo, pairs in _all_pairs_from_dataframe(sheet_df).items():
+            combined.setdefault(combo, []).extend(pairs)
+    return combined
 
 
 # ---------------------------------------------------------------------
@@ -214,38 +226,10 @@ def _save_store(store_path: Path, embeddings: np.ndarray, metadata: list[dict]):
         json.dump(metadata, f, ensure_ascii=False)
 
 
-def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict:
-    """
-    Ingest a CSV, XLSX, or PDF dataset and add it to the (lang_a <-> lang_b)
-    translation memory. Creates the store if it doesn't exist, or merges
-    into it.
-
-    Returns: {"success": bool, "count": int, "message": str}
-    """
-    ext = Path(file_path).suffix.lower()
-
-    try:
-        if ext == ".csv":
-            pairs = _pairs_from_csv(file_path, lang_a, lang_b)
-        elif ext in (".xlsx", ".xlsm"):
-            pairs = _pairs_from_xlsx(file_path, lang_a, lang_b)
-        elif ext == ".pdf":
-            pairs = _pairs_from_pdf(file_path)
-        else:
-            return {"success": False, "count": 0, "message": f"Unsupported file type: {ext}"}
-    except Exception as e:
-        return {"success": False, "count": 0, "message": f"Could not read file: {e}"}
-
+def _train_pairs_into_store(lang_a: str, lang_b: str, pairs: list[tuple[str, str]]) -> int:
+    """Embed `pairs` and merge them into the (lang_a <-> lang_b) store. Returns count added."""
     if not pairs:
-        return {
-            "success": False,
-            "count": 0,
-            "message": (
-                f"No valid '{lang_a}' / '{lang_b}' sentence pairs found in the file. "
-                "Make sure it has two columns — one per language — with matching translations "
-                "in each row (not just single-language word lists or tagging data)."
-            ),
-        }
+        return 0
 
     texts: list[str] = []
     metadata: list[dict] = []
@@ -259,10 +243,7 @@ def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict
             {"source_lang": lang_b, "target_lang": lang_a, "source_text": b_text, "target_text": a_text}
         )
 
-    try:
-        new_embeddings = _embed_texts(texts)
-    except Exception as e:
-        return {"success": False, "count": 0, "message": f"Embedding request failed: {e}"}
+    new_embeddings = _embed_texts(texts)
 
     store_path = _store_path(lang_a, lang_b)
     if _embeddings_file(store_path).exists():
@@ -277,11 +258,77 @@ def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict
     with open(_info_file(store_path), "w", encoding="utf-8") as f:
         json.dump({"lang_a": lang_a, "lang_b": lang_b}, f, ensure_ascii=False)
 
-    return {
-        "success": True,
-        "count": len(pairs),
-        "message": f"Trained on {len(pairs)} pairs for '{lang_a}' <-> '{lang_b}' (from {ext} file).",
-    }
+    return len(pairs)
+
+
+def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict:
+    """
+    Ingest a CSV, XLSX, or PDF dataset into the translation memory.
+
+    For CSV/XLSX files, EVERY language column found in the file (any
+    column that isn't an ID/index column) is used — not just two fixed
+    ones. A separate trained (bidirectional) pair is created for every
+    2-column combination, e.g. a sheet with English, Tagalog, and
+    Kapampangan columns yields English↔Tagalog, English↔Kapampangan, and
+    Tagalog↔Kapampangan pairs from a single upload.
+
+    `lang_a`/`lang_b` are used as the pair for PDF glossaries only, since
+    those are parsed line-by-line as strictly two-column (source/target).
+
+    Returns: {"success": bool, "count": int, "message": str}
+    """
+    ext = Path(file_path).suffix.lower()
+
+    try:
+        if ext == ".csv":
+            pairs_by_combo = _all_pairs_from_csv(file_path)
+        elif ext in (".xlsx", ".xlsm"):
+            pairs_by_combo = _all_pairs_from_xlsx(file_path)
+        elif ext == ".pdf":
+            pdf_pairs = _pairs_from_pdf(file_path)
+            pairs_by_combo = {(lang_a, lang_b): pdf_pairs} if pdf_pairs else {}
+        else:
+            return {"success": False, "count": 0, "message": f"Unsupported file type: {ext}"}
+    except Exception as e:
+        return {"success": False, "count": 0, "message": f"Could not read file: {e}"}
+
+    pairs_by_combo = {combo: p for combo, p in pairs_by_combo.items() if p}
+
+    if not pairs_by_combo:
+        return {
+            "success": False,
+            "count": 0,
+            "message": (
+                "No valid sentence pairs found in the file. Make sure it has at least two "
+                "language columns — one per language — with matching translations in each "
+                "row (not just single-language word lists or tagging data)."
+            ),
+        }
+
+    total_count = 0
+    trained_summaries = []
+    errors = []
+    for (col_a, col_b), pairs in pairs_by_combo.items():
+        try:
+            count = _train_pairs_into_store(col_a, col_b, pairs)
+        except Exception as e:
+            errors.append(f"{col_a} <-> {col_b}: {e}")
+            continue
+        total_count += count
+        trained_summaries.append(f"{col_a} ↔ {col_b} ({count})")
+
+    if total_count == 0:
+        return {
+            "success": False,
+            "count": 0,
+            "message": "Training failed for all detected language pairs: " + "; ".join(errors),
+        }
+
+    message = f"Trained on {total_count} pairs from {ext} file: " + ", ".join(trained_summaries)
+    if errors:
+        message += f". Some pairs failed: {'; '.join(errors)}"
+
+    return {"success": True, "count": total_count, "message": message}
 
 
 def language_pair_is_trained(lang_a: str, lang_b: str) -> bool:
@@ -609,4 +656,4 @@ def transcribe_and_translate_audio(
         "examples_used": result["examples_used"],
         "trained": result["trained"],
         "pronunciation_samples_used": len(reference_examples),
-    }
+        }
