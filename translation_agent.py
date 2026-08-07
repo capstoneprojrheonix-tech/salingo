@@ -126,12 +126,53 @@ def _info_file(store_path: Path) -> Path:
 # Parsing: CSV / XLSX (tabular, two language columns)
 # ---------------------------------------------------------------------
 
-def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, str]:
+# ---------------------------------------------------------------------
+# Parsing: CSV / XLSX (tabular, two language columns)
+# ---------------------------------------------------------------------
+
+# Column headers that are clearly not language text (row numbers, IDs,
+# etc.) — excluded from guessing so they're never mistaken for a
+# language column.
+_ID_LIKE_COLUMNS = {"id", "no", "no.", "num", "number", "#", "index", "row", "count", "item"}
+
+
+def _looks_like_id_column(col_name: str) -> bool:
+    return col_name.strip().lower() in _ID_LIKE_COLUMNS
+
+
+def _find_col(name: str, cols: list[str]) -> Optional[str]:
+    """Exact match first, then substring match (handles things like a
+    'Kapampangan Text' header when the user typed just 'Kapampangan')."""
+    name = name.strip().lower()
+    if not name:
+        return None
+    if name in cols:
+        return name
+    for c in cols:
+        if name in c or c in name:
+            return c
+    return None
+
+
+def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, str, Optional[str]]:
+    """
+    Figures out which two columns hold `lang_a` and `lang_b` text.
+
+    Returns (a_col, b_col, note). `note` is None when the columns were
+    matched by name, or a short human-readable explanation when Claude
+    had to guess positionally (e.g. the language name typed doesn't
+    match any header) — this is surfaced back in the training result
+    message so the person can double check it guessed right.
+
+    Design goal: the language name typed in Language Management should
+    NEVER have to exactly match a column header. Any file with at least
+    two non-ID columns can be trained.
+    """
     cols = [str(c).strip().lower() for c in df.columns]
     df.columns = cols
 
-    a_col = lang_a.strip().lower() if lang_a.strip().lower() in cols else None
-    b_col = lang_b.strip().lower() if lang_b.strip().lower() in cols else None
+    a_col = _find_col(lang_a, cols)
+    b_col = _find_col(lang_b, cols)
 
     # Backward-compatible fallback for the old "english"/"en" convention.
     if b_col is None and lang_b.strip().lower() == "english":
@@ -139,39 +180,54 @@ def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, st
     if a_col is None and lang_a.strip().lower() == "english":
         a_col = next((c for c in ("english", "en") if c in cols), None)
 
-    if a_col is None or b_col is None:
-        if len(cols) < 2:
-            raise ValueError(f"File must have at least 2 columns, got: {df.columns.tolist()}")
+    if a_col and b_col and a_col != b_col:
+        return a_col, b_col, None
 
-        # Only guess positionally when there's no real ambiguity — i.e. the
-        # file has EXACTLY 2 columns, so there's nothing else it could mean.
-        # With 3+ columns (like ID/English/Tagalog/Kapampangan), guessing
-        # would silently read the wrong column (e.g. an ID column) as if it
-        # were sentence text. Fail loudly instead so the mistake is obvious
-        # immediately, not buried in bad training data.
-        if len(cols) == 2:
-            a_col = a_col or cols[0]
-            b_col = b_col or cols[1]
-        else:
-            missing = []
-            if a_col is None:
-                missing.append(lang_a)
-            if b_col is None:
-                missing.append(lang_b)
-            raise ValueError(
-                f"Could not find a column matching {missing} in this file. "
-                f"Available columns: {df.columns.tolist()}. "
-                "The language name you typed must exactly match one of the column "
-                "headers (case-insensitive) — check for typos or extra spaces."
-            )
+    # No confident name match (or both names pointed at the same column)
+    # — fall back to best-effort guessing using whatever columns are left
+    # after excluding obvious ID/row-number columns.
+    candidate_cols = [c for c in cols if not _looks_like_id_column(c)]
 
-    return a_col, b_col
+    if len(candidate_cols) < 2:
+        raise ValueError(
+            f"File must have at least 2 usable language columns (excluding "
+            f"ID-style columns), got: {df.columns.tolist()}"
+        )
+
+    if a_col and not b_col:
+        remaining = [c for c in candidate_cols if c != a_col]
+        b_col = remaining[0]
+        note = (
+            f"'{lang_b}' didn't match any column header, so the '{b_col}' "
+            f"column was used for it — double-check this is right."
+        )
+    elif b_col and not a_col:
+        remaining = [c for c in candidate_cols if c != b_col]
+        a_col = remaining[0]
+        note = (
+            f"'{lang_a}' didn't match any column header, so the '{a_col}' "
+            f"column was used for it — double-check this is right."
+        )
+    else:
+        # Neither language name matched anything in the file — best-effort
+        # positional guess using the first two usable columns, in the
+        # order they appear. This is what lets ANY file train, even one
+        # whose headers have nothing to do with the language name typed.
+        a_col, b_col = candidate_cols[0], candidate_cols[1]
+        note = (
+            f"Neither '{lang_a}' nor '{lang_b}' matched a column header, so "
+            f"the first two usable columns ('{a_col}' and '{b_col}') were "
+            f"used — double-check this is right, or rename your file's "
+            f"columns to match if it picked the wrong ones."
+        )
+
+    return a_col, b_col, note
 
 
-def _pairs_from_dataframe(df: pd.DataFrame, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+def _pairs_from_dataframe(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[list[tuple[str, str]], Optional[str]]:
     if df.empty:
-        return []
-    a_col, b_col = _detect_columns(df, lang_a, lang_b)
+        return [], None
+    a_col, b_col, note = _detect_columns(df, lang_a, lang_b)
 
     pairs = []
     for _, row in df.iterrows():
@@ -179,18 +235,20 @@ def _pairs_from_dataframe(df: pd.DataFrame, lang_a: str, lang_b: str) -> list[tu
         b_text = str(row.get(b_col, "")).strip()
         if a_text and b_text and a_text.lower() != "nan" and b_text.lower() != "nan":
             pairs.append((a_text, b_text))
-    return pairs
+    return pairs, note
 
 
-def _pairs_from_csv(csv_path: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+def _pairs_from_csv(csv_path: str, lang_a: str, lang_b: str) -> tuple[list[tuple[str, str]], Optional[str]]:
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
     return _pairs_from_dataframe(df, lang_a, lang_b)
 
 
-def _pairs_from_xlsx(xlsx_path: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+def _pairs_from_xlsx(xlsx_path: str, lang_a: str, lang_b: str) -> tuple[list[tuple[str, str]], Optional[str]]:
     df = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl")
     df = df.fillna("")
     return _pairs_from_dataframe(df, lang_a, lang_b)
+
+
 
 
 # ---------------------------------------------------------------------
@@ -202,12 +260,60 @@ _GLOSSARY_LINE_RE = re.compile(
 )
 
 
-def _pairs_from_pdf(pdf_path: str) -> list[tuple[str, str]]:
+def _pairs_via_gemini_extraction(text: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+    """
+    Best-effort extraction of (source, target) translation pairs from
+    unstructured text using Gemini itself. This is the fallback for PDFs
+    (or any dataset) that aren't laid out as a clean two-column glossary —
+    e.g. translations embedded in prose, tables that didn't extract
+    cleanly, or mixed formatting — so training isn't limited to rigidly
+    formatted files.
+    """
+    text = text[:60000]  # cap input — this is for glossary-style docs, not whole books
+
+    lang_hint = f" The two languages involved are '{lang_a}' and '{lang_b}'." if lang_a and lang_b else ""
+
+    prompt = (
+        "Extract every translation pair you can find in the text below and return "
+        "them as a JSON array of [source, target] pairs — respond with ONLY the "
+        "JSON array, no explanations, no markdown code fences." + lang_hint +
+        " Only include genuine word/phrase/sentence translation pairs — skip "
+        "headers, page numbers, and unrelated text.\n\nText:\n" + text
+    )
+
+    client = get_client()
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.0),
+    )
+
+    raw = (response.text or "").strip()
+    raw = re.sub(r"^```(?:json)?", "", raw).strip()
+    raw = re.sub(r"```$", "", raw).strip()
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+    pairs = []
+    for item in data if isinstance(data, list) else []:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            a_text, b_text = str(item[0]).strip(), str(item[1]).strip()
+            if a_text and b_text:
+                pairs.append((a_text, b_text))
+    return pairs
+
+
+def _pairs_from_pdf(pdf_path: str, lang_a: str = "", lang_b: str = "") -> tuple[list[tuple[str, str]], Optional[str]]:
     reader = PdfReader(pdf_path)
     pairs = []
+    full_text_parts = []
 
     for page in reader.pages:
         text = page.extract_text() or ""
+        full_text_parts.append(text)
         for line in text.splitlines():
             line = line.strip()
             if not line:
@@ -223,7 +329,73 @@ def _pairs_from_pdf(pdf_path: str) -> list[tuple[str, str]]:
                 continue
             pairs.append((source, target))
 
-    return pairs
+    if pairs:
+        return pairs, None
+
+    # No clean "source - target" glossary lines found — the PDF might still
+    # have translations in it (a table that didn't extract as neat lines,
+    # prose with inline translations, etc.). Fall back to asking Gemini to
+    # pull pairs out of the raw extracted text directly.
+    full_text = "\n".join(full_text_parts).strip()
+    if not full_text:
+        return [], None
+
+    try:
+        pairs = _pairs_via_gemini_extraction(full_text, lang_a, lang_b)
+    except Exception:
+        return [], None
+
+    note = None
+    if pairs:
+        note = (
+            "This PDF wasn't a simple 'source - target' line-by-line glossary, so "
+            "Gemini was used to extract the translation pairs from the text directly "
+            "— spot-check a few entries after training to make sure they're correct."
+        )
+    return pairs, note
+
+
+def _pairs_from_txt(txt_path: str, lang_a: str = "", lang_b: str = "") -> tuple[list[tuple[str, str]], Optional[str]]:
+    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+
+    pairs = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = _GLOSSARY_LINE_RE.match(line)
+        if not match:
+            continue
+        source = match.group("source").strip()
+        target = match.group("target").strip()
+        if not source or not target:
+            continue
+        if source.replace(" ", "").isdigit() or target.replace(" ", "").isdigit():
+            continue
+        pairs.append((source, target))
+
+    if pairs:
+        return pairs, None
+
+    if not text.strip():
+        return [], None
+
+    try:
+        pairs = _pairs_via_gemini_extraction(text, lang_a, lang_b)
+    except Exception:
+        return [], None
+
+    note = None
+    if pairs:
+        note = (
+            "This text file wasn't a simple 'source - target' line-by-line glossary, "
+            "so Gemini was used to extract the translation pairs directly — "
+            "spot-check a few entries after training."
+        )
+    return pairs, note
+
+
 
 
 # ---------------------------------------------------------------------
@@ -264,17 +436,25 @@ def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict
     translation memory. Creates the store if it doesn't exist, or merges
     into it.
 
+    Column/pair detection is always best-effort: the language name typed
+    doesn't need to exactly match anything in the file. When Claude has to
+    guess, a short `note` explaining the guess is folded into the returned
+    message so it can be spot-checked.
+
     Returns: {"success": bool, "count": int, "message": str}
     """
     ext = Path(file_path).suffix.lower()
+    note: Optional[str] = None
 
     try:
         if ext == ".csv":
-            pairs = _pairs_from_csv(file_path, lang_a, lang_b)
+            pairs, note = _pairs_from_csv(file_path, lang_a, lang_b)
         elif ext in (".xlsx", ".xlsm"):
-            pairs = _pairs_from_xlsx(file_path, lang_a, lang_b)
+            pairs, note = _pairs_from_xlsx(file_path, lang_a, lang_b)
         elif ext == ".pdf":
-            pairs = _pairs_from_pdf(file_path)
+            pairs, note = _pairs_from_pdf(file_path, lang_a, lang_b)
+        elif ext == ".txt":
+            pairs, note = _pairs_from_txt(file_path, lang_a, lang_b)
         else:
             return {"success": False, "count": 0, "message": f"Unsupported file type: {ext}"}
     except Exception as e:
@@ -285,9 +465,11 @@ def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict
             "success": False,
             "count": 0,
             "message": (
-                f"No valid '{lang_a}' / '{lang_b}' sentence pairs found in the file. "
-                "Make sure it has two columns — one per language — with matching translations "
-                "in each row (not just single-language word lists or tagging data)."
+                f"No translation pairs could be found in this file for '{lang_a}' / "
+                f"'{lang_b}'. Make sure it actually contains matching translations — "
+                "either two columns (one per language) with the same rows lined up, "
+                "or, for PDFs, some recognizable source/target text — not just a "
+                "single-language word list or unrelated data."
             ),
         }
 
@@ -321,11 +503,17 @@ def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict
     with open(_info_file(store_path), "w", encoding="utf-8") as f:
         json.dump({"lang_a": lang_a, "lang_b": lang_b}, f, ensure_ascii=False)
 
+    message = f"Trained on {len(pairs)} pairs for '{lang_a}' <-> '{lang_b}' (from {ext} file)."
+    if note:
+        message += f" Note: {note}"
+
     return {
         "success": True,
         "count": len(pairs),
-        "message": f"Trained on {len(pairs)} pairs for '{lang_a}' <-> '{lang_b}' (from {ext} file).",
+        "message": message,
     }
+
+
 
 
 def language_pair_is_trained(lang_a: str, lang_b: str) -> bool:
@@ -742,4 +930,4 @@ def transcribe_and_translate_audio(
         "examples_used": result["examples_used"],
         "trained": result["trained"],
         "pronunciation_samples_used": len(reference_examples),
-    }
+                   }
