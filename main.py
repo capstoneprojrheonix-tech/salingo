@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -156,6 +156,25 @@ def train_audio(
         raise HTTPException(400, result["message"])
 
     return result
+
+
+@app.post("/synthesize-speech")
+def synthesize_speech(
+    text: str = Form(...),
+    language: str = Form(...),
+):
+    """
+    Voice-clones speech for `language` from the trained pronunciation
+    samples in audio_training/<language>/ (same corpus collected via
+    /train-audio). Lets languages with no OS/browser TTS voice — e.g.
+    Kapampangan — still be spoken aloud on the frontend.
+    """
+    result = agent.synthesize_speech(text, language)
+
+    if not result["success"]:
+        raise HTTPException(400, result["message"])
+
+    return Response(content=result["audio"], media_type=result["mime_type"])
 
 
 @app.get("/audio-samples")
