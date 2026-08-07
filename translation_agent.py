@@ -23,6 +23,7 @@ import os
 import re
 import json
 import shutil
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -38,10 +39,14 @@ load_dotenv()
 BASE_DIR = Path(__file__).parent
 VECTORSTORE_DIR = BASE_DIR / "vectorstores"
 VECTORSTORE_DIR.mkdir(exist_ok=True)
+AUDIO_TRAIN_DIR = BASE_DIR / "audio_training"
+AUDIO_TRAIN_DIR.mkdir(exist_ok=True)
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 CHAT_MODEL = "gemini-3.5-flash"
 EMBEDDING_BATCH_SIZE = 100
+MAX_AUDIO_EXAMPLES_PER_REQUEST = 5  # how many reference clips to feed Gemini per transcription
+MAX_AUDIO_SAMPLE_BYTES = 5 * 1024 * 1024  # 5 MB cap per training clip
 
 _client = None
 
@@ -376,32 +381,181 @@ def translate_text(
 
 
 # ---------------------------------------------------------------------
-# Speech-to-text (transcription) + translation
+# Voice pronunciation training (audio reference samples)
 # ---------------------------------------------------------------------
+# Unlike train_language() (text glossary -> embeddings), this stores short
+# audio clips + their correct transcript per language. There's no audio
+# similarity search here — a capped batch of the most recently added
+# samples for that language is fed to Gemini as few-shot reference audio
+# on every transcription call, to calibrate it to the speaker's accent,
+# pronunciation, and spelling conventions for that language.
 
-def _transcribe_audio(file_path: str, mime_type: str, spoken_language: str) -> str:
+def _audio_lang_dir(language: str) -> Path:
+    return AUDIO_TRAIN_DIR / _slug(language)
+
+
+def _audio_metadata_file(lang_dir: Path) -> Path:
+    return lang_dir / "metadata.json"
+
+
+def _load_audio_metadata(lang_dir: Path) -> list[dict]:
+    meta_file = _audio_metadata_file(lang_dir)
+    if not meta_file.exists():
+        return []
+    with open(meta_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_audio_metadata(lang_dir: Path, metadata: list[dict]):
+    lang_dir.mkdir(parents=True, exist_ok=True)
+    with open(_audio_metadata_file(lang_dir), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False)
+
+
+def train_audio_sample(language: str, file_path: str, mime_type: str, transcript: str) -> dict:
+    """
+    Save a short audio clip + its correct transcript as a pronunciation
+    reference sample for `language`.
+
+    Returns: {"success": bool, "count": int, "message": str}
+    """
+    transcript = transcript.strip()
+    if not transcript:
+        return {"success": False, "count": 0, "message": "Please provide the correct transcript for this recording."}
+
+    src = Path(file_path)
+    if not src.exists():
+        return {"success": False, "count": 0, "message": "Audio file not found."}
+
+    size = src.stat().st_size
+    if size > MAX_AUDIO_SAMPLE_BYTES:
+        return {
+            "success": False,
+            "count": 0,
+            "message": (
+                f"Audio clip is too large ({size // 1024} KB). Keep clips under "
+                f"{MAX_AUDIO_SAMPLE_BYTES // (1024 * 1024)} MB — a few seconds is enough."
+            ),
+        }
+
+    lang_dir = _audio_lang_dir(language)
+    lang_dir.mkdir(parents=True, exist_ok=True)
+    metadata = _load_audio_metadata(lang_dir)
+
+    sample_id = uuid.uuid4().hex[:12]
+    ext = src.suffix or ".webm"
+    dest_filename = f"{sample_id}{ext}"
+    shutil.copyfile(src, lang_dir / dest_filename)
+
+    metadata.append(
+        {
+            "id": sample_id,
+            "filename": dest_filename,
+            "mime_type": mime_type,
+            "transcript": transcript,
+            "language": language,
+        }
+    )
+    _save_audio_metadata(lang_dir, metadata)
+
+    return {
+        "success": True,
+        "count": len(metadata),
+        "message": f"Saved pronunciation sample for '{language}' ({len(metadata)} total).",
+    }
+
+
+def list_audio_samples(language: str) -> list[dict]:
+    """Returns [{"id": ..., "transcript": ...}, ...] for a given language."""
+    lang_dir = _audio_lang_dir(language)
+    metadata = _load_audio_metadata(lang_dir)
+    return [{"id": m["id"], "transcript": m["transcript"]} for m in metadata]
+
+
+def delete_audio_sample(language: str, sample_id: str) -> bool:
+    lang_dir = _audio_lang_dir(language)
+    metadata = _load_audio_metadata(lang_dir)
+    match = next((m for m in metadata if m["id"] == sample_id), None)
+    if not match:
+        return False
+
+    file_path = lang_dir / match["filename"]
+    if file_path.exists():
+        file_path.unlink()
+
+    metadata = [m for m in metadata if m["id"] != sample_id]
+    _save_audio_metadata(lang_dir, metadata)
+    return True
+
+
+def _load_audio_examples(language: str, max_examples: int = MAX_AUDIO_EXAMPLES_PER_REQUEST) -> list[dict]:
+    lang_dir = _audio_lang_dir(language)
+    metadata = _load_audio_metadata(lang_dir)
+    if not metadata:
+        return []
+
+    chosen = metadata[-max_examples:]  # most recently added samples
+    examples = []
+    for m in chosen:
+        file_path = lang_dir / m["filename"]
+        if not file_path.exists():
+            continue
+        with open(file_path, "rb") as f:
+            data = f.read()
+        examples.append({"data": data, "mime_type": m["mime_type"], "transcript": m["transcript"]})
+    return examples
+
+
+
+def _transcribe_audio(
+    file_path: str,
+    mime_type: str,
+    spoken_language: str,
+    reference_examples: Optional[list[dict]] = None,
+) -> str:
     """
     Transcribe a short audio clip using Gemini's audio understanding.
     Works for any language the model has been told to expect, including
     languages with no dedicated browser speech-recognition support
     (e.g. Kapampangan).
+
+    If `reference_examples` is provided (each a dict with "data",
+    "mime_type", "transcript"), they're fed to Gemini first as few-shot
+    reference recordings — trained pronunciation samples for this
+    language — to calibrate its understanding of accent, pronunciation,
+    and spelling before it transcribes the real clip.
     """
     with open(file_path, "rb") as f:
         audio_bytes = f.read()
 
+    contents: list = [
+        f"You are an expert speech transcriber for the '{spoken_language}' language, "
+        "including regional accents and non-standard spellings."
+    ]
+
+    if reference_examples:
+        contents.append(
+            "Here are reference recordings from a trained speaker in this language, each "
+            "followed by its correct transcript. Use these ONLY to calibrate your "
+            "understanding of pronunciation and spelling conventions — do NOT transcribe "
+            "these reference clips themselves."
+        )
+        for example in reference_examples:
+            contents.append(types.Part.from_bytes(data=example["data"], mime_type=example["mime_type"]))
+            contents.append(f"Reference transcript: {example['transcript']}")
+
+    contents.append(
+        f"Now transcribe ONLY the following new audio clip. Respond with ONLY the "
+        f"verbatim transcript in '{spoken_language}' — no explanations, no quotes, no "
+        "extra commentary. If the audio is silent or unintelligible, respond with an "
+        "empty string."
+    )
+    contents.append(types.Part.from_bytes(data=audio_bytes, mime_type=mime_type))
+
     client = get_client()
     response = client.models.generate_content(
         model=CHAT_MODEL,
-        contents=[
-            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
-            (
-                f"Transcribe the speech in this audio clip. The speaker is speaking "
-                f"in '{spoken_language}'. Respond with ONLY the verbatim transcript in "
-                f"'{spoken_language}' — no translation, no explanations, no quotes, no "
-                "extra commentary. If the audio is silent or unintelligible, respond "
-                "with an empty string."
-            ),
-        ],
+        contents=contents,
         config=types.GenerateContentConfig(temperature=0.0),
     )
 
@@ -421,7 +575,8 @@ def transcribe_and_translate_audio(
 
     Returns: {"transcript": str, "translation": str, "examples_used": int, "trained": bool}
     """
-    transcript = _transcribe_audio(file_path, mime_type, source_language)
+    reference_examples = _load_audio_examples(source_language)
+    transcript = _transcribe_audio(file_path, mime_type, source_language, reference_examples)
 
     if not transcript:
         return {
@@ -439,4 +594,5 @@ def transcribe_and_translate_audio(
         "translation": result["translation"],
         "examples_used": result["examples_used"],
         "trained": result["trained"],
+        "pronunciation_samples_used": len(reference_examples),
     }
