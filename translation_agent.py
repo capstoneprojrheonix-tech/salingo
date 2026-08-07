@@ -130,9 +130,23 @@ def _pairs_from_csv(csv_path: str, lang_a: str, lang_b: str) -> list[tuple[str, 
 
 
 def _pairs_from_xlsx(xlsx_path: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
-    df = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl")
-    df = df.fillna("")
-    return _pairs_from_dataframe(df, lang_a, lang_b)
+    # sheet_name=None loads every sheet as {sheet_name: DataFrame}, instead
+    # of silently defaulting to just the first sheet — some exports (e.g.
+    # FAQ workbooks) split content across multiple sheets like
+    # "Questions" / "Answers".
+    sheets = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl", sheet_name=None)
+
+    all_pairs: list[tuple[str, str]] = []
+    for sheet_df in sheets.values():
+        sheet_df = sheet_df.fillna("")
+        try:
+            all_pairs.extend(_pairs_from_dataframe(sheet_df, lang_a, lang_b))
+        except ValueError:
+            # This sheet doesn't have the columns we need (e.g. fewer than
+            # 2 columns, or an unrelated summary sheet) — skip it instead
+            # of failing the whole file.
+            continue
+    return all_pairs
 
 
 # ---------------------------------------------------------------------
