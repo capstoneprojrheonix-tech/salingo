@@ -1,484 +1,375 @@
-<?php
-session_start();
-include("db.php");
+"""
+SALINGO Translation Engine (Gemini edition, multi-language-pair)
+------------------------------------------------------------------
+"Training" here means building a translation memory (RAG), not fine-tuning.
 
-if (!isset($_SESSION['ID'])) {
-    header("Location: index.php");
-    exit();
-}
+Unlike the original version (which only supported "Language <-> English"),
+this version supports ANY language pair, e.g. Kapampangan <-> Tagalog,
+Kapampangan <-> English, Tagalog <-> English, etc.
 
-// Hardcoded Render backend URL — no need for the user to type it in anymore.
-$SALINGO_API_BASE = "https://salingo-api.onrender.com";
-?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>SALINGO — Translate</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-<style>
-  :root {
-    --bg: #0E1422;
-    --panel: #131b2e;
-    --panel-border: #1f2b45;
-    --gold: #ffce1b;
-    --text: #e9ecf5;
-    --text-dim: #8b93a8;
-    --ok: #3ddc84;
-    --err: #ff5d5d;
-  }
-  * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', sans-serif; }
-  body { background: var(--bg); color: var(--text); min-height: 100vh; padding: 40px 20px; }
-  .wrap { max-width: 960px; margin: 0 auto; }
-  header { margin-bottom: 32px; display: flex; align-items: center; justify-content: space-between; }
-  header .eyebrow { color: var(--gold); letter-spacing: 3px; font-size: 12px; text-transform: uppercase; }
-  header h1 { font-size: 28px; margin-top: 6px; }
-  header p { color: var(--text-dim); margin-top: 6px; font-size: 14px; }
-  .back-link { color: var(--text-dim); text-decoration: none; font-size: 14px; display: inline-flex; align-items: center; gap: 6px; }
-  .back-link:hover { color: var(--gold); }
+Each trained pair is stored under:
+    vectorstores/<lang_a>__<lang_b>/embeddings.npy
+    vectorstores/<lang_a>__<lang_b>/metadata.json
+    vectorstores/<lang_a>__<lang_b>/info.json   (original casing of both names)
 
-  .status-bar {
-    display: flex; gap: 10px; align-items: center; margin-bottom: 28px;
-    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px;
-    padding: 12px 16px; font-size: 13px; color: var(--text-dim);
-  }
+<lang_a> and <lang_b> are alphabetically sorted slugs, so training
+"Kapampangan -> Tagalog" and "Tagalog -> Kapampangan" both land in the
+same store (bidirectional).
 
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+Supported training file formats: .csv, .xlsx, .pdf (glossary-style).
+"""
 
-  .card {
-    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 12px;
-    padding: 20px;
-  }
-  .card h2 { font-size: 16px; color: var(--gold); margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
-  .card h2 .num { background: rgba(255,206,27,0.12); color: var(--gold); width: 22px; height: 22px;
-    border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 12px; }
+import os
+import re
+import json
+import shutil
+from pathlib import Path
+from typing import Optional
 
-  label.field-label { display: block; font-size: 12px; color: var(--text-dim); margin: 12px 0 4px; }
-  input[type=text], textarea, select {
-    width: 100%; background: #0b1120; border: 1px solid var(--panel-border); color: var(--text);
-    border-radius: 8px; padding: 10px 12px; font-size: 14px; resize: vertical;
-  }
-  textarea { min-height: 90px; }
-  select { appearance: none; }
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from pypdf import PdfReader
 
-  .direction-toggle { display: flex; gap: 8px; margin-top: 12px; }
-  .direction-toggle button {
-    flex: 1; background: #0b1120; border: 1px solid var(--panel-border); color: var(--text-dim);
-    padding: 8px; border-radius: 8px; cursor: pointer; font-size: 12px;
-  }
-  .direction-toggle button.active { border-color: var(--gold); color: var(--gold); background: rgba(255,206,27,0.08); }
+load_dotenv()
 
-  button.primary {
-    margin-top: 16px; width: 100%; background: var(--gold); color: #14100a; border: none;
-    padding: 12px; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 14px;
-  }
-  button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+BASE_DIR = Path(__file__).parent
+VECTORSTORE_DIR = BASE_DIR / "vectorstores"
+VECTORSTORE_DIR.mkdir(exist_ok=True)
 
-  .result { margin-top: 16px; padding: 14px; border-radius: 8px; background: #0b1120; border: 1px solid var(--panel-border);
-    font-size: 14px; line-height: 1.5; min-height: 20px; white-space: pre-wrap; }
-  .result.ok { border-color: var(--ok); }
-  .result.err { border-color: var(--err); color: var(--err); }
-  .meta { font-size: 11px; color: var(--text-dim); margin-top: 8px; }
+EMBEDDING_MODEL = "gemini-embedding-001"
+CHAT_MODEL = "gemini-3.5-flash"
+EMBEDDING_BATCH_SIZE = 100
 
-  .file-drop { margin-top: 12px; border: 1px dashed var(--panel-border); border-radius: 8px; padding: 16px;
-    text-align: center; color: var(--text-dim); font-size: 13px; }
-  .file-drop input { display: none; }
-  .file-drop label { cursor: pointer; color: var(--gold); }
-
-  .trained-list { margin-top: 24px; }
-  .trained-list h2 { font-size: 14px; color: var(--text-dim); margin-bottom: 8px; }
-  .chips { display: flex; flex-wrap: wrap; gap: 8px; }
-  .chip { background: rgba(255,206,27,0.1); color: var(--gold); border: 1px solid rgba(255,206,27,0.3);
-    padding: 4px 10px; border-radius: 999px; font-size: 12px; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <div>
-      <div class="eyebrow">SALINGO</div>
-      <h1>Translate</h1>
-      <p>Powered by the SALINGO translation memory service.</p>
-    </div>
-    <a class="back-link" href="languageManagement.php"><i class="fa-solid fa-arrow-left"></i> Back to Language Management</a>
-  </header>
-
-  <div class="status-bar">
-    <span>Service status:</span>
-    <span id="healthStatus">checking...</span>
-  </div>
-
-  <div class="grid">
-    <div class="card">
-      <h2><span class="num">1</span> Translate</h2>
-
-      <div style="display:flex; gap:8px; align-items:flex-end;">
-        <div style="flex:1;">
-          <label class="field-label">From</label>
-          <select id="fromLang" onchange="onLangSelectChange('fromLang','fromLangCustom')">
-            <option value="Kapampangan">Kapampangan</option>
-            <option value="Tagalog">Tagalog</option>
-            <option value="English">English</option>
-            <option value="__custom__">Other...</option>
-          </select>
-          <input type="text" id="fromLangCustom" placeholder="Type language" style="display:none; margin-top:6px;" />
-        </div>
-        <button type="button" onclick="swapLangs()" title="Swap" style="height:38px; width:38px; flex-shrink:0; background:#0b1120; border:1px solid var(--panel-border); color:var(--gold); border-radius:8px; cursor:pointer;">⇄</button>
-        <div style="flex:1;">
-          <label class="field-label">To</label>
-          <select id="toLang" onchange="onLangSelectChange('toLang','toLangCustom')">
-            <option value="Tagalog">Tagalog</option>
-            <option value="English" selected>English</option>
-            <option value="Kapampangan">Kapampangan</option>
-            <option value="__custom__">Other...</option>
-          </select>
-          <input type="text" id="toLangCustom" placeholder="Type language" style="display:none; margin-top:6px;" />
-        </div>
-      </div>
-
-      <label class="field-label">Text to translate</label>
-      <textarea id="translateText" placeholder="Type or paste text here..."></textarea>
-
-      <button class="primary" id="translateBtn" onclick="doTranslate()">Translate</button>
-
-      <div id="translateResult" class="result" style="display:none;"></div>
-    </div>
-
-    <div class="card">
-      <h2><span class="num">2</span> Speech to Text</h2>
-      <p class="meta" style="margin-bottom:12px;">Speech-to-text uses Gemini's audio understanding — works for any language, including Kapampangan. Text-to-speech uses your browser's built-in voices, which don't include Kapampangan.</p>
-
-      <label class="field-label" style="margin-top:4px;">Please Select Language you want to Speak</label>
-      <select id="speakLang" onchange="validateSpeechLangs()">
-        <option value="Kapampangan" selected>Kapampangan</option>
-        <option value="Tagalog">Tagalog</option>
-        <option value="English">English</option>
-      </select>
-
-     <label class="field-label" style="margin-top:4px;">Please Select Language you want to Translate</label>
-      <select id="speechToLang" onchange="validateSpeechLangs()">
-        <option value="Tagalog" selected>Tagalog</option>
-        <option value="English">English</option>
-        <option value="Kapampangan">Kapampangan</option>
-      </select>
-      <div id="speechLangWarning" class="meta" style="display:none; color:var(--err); margin-top:6px;">
-        "Speak" and "Translate" languages must be different.
-      </div>
+_client = None
 
 
+def get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+    return _client
 
 
-
-      <button class="primary" id="micBtn" onclick="toggleRecording()" style="margin-top:8px;">
-        <i class="fa-solid fa-microphone"></i> Start recording
-      </button>
-      <div id="sttResult" class="result" style="display:none;"></div>
-
-      <label class="field-label" style="margin-top:10px;">Translation Result</label>
-      <textarea id="sttTranslationResult" placeholder="Translation result will appear here..." readonly style="margin-top:6px;"></textarea>
+def _slug(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9-]+", "_", name.strip().lower())
+    return slug.strip("_") or "unknown"
 
 
+def _pair_slug(lang_a: str, lang_b: str) -> str:
+    a, b = sorted([_slug(lang_a), _slug(lang_b)])
+    return f"{a}__{b}"
 
 
-      <label class="field-label" style="margin-top:20px;">Text → Speech</label>
-      <select id="speechLang">
-        <option value="en-US">English</option>
-        <option value="fil-PH">Filipino / Tagalog</option>
-        <option value="__kapampangan__">Kapampangan (no browser voice available)</option>
-      </select>
-      <div id="kapampanganNote" class="meta" style="display:none; color:var(--err); margin-top:6px;">
-        No browser or OS ships a Kapampangan voice, so this text can't be spoken aloud. The transcription/translation above still works fine for Kapampangan.
-      </div>
-      <textarea id="ttsText" placeholder="Type text to hear it spoken, or click below to speak the translation result..." style="margin-top:10px;"></textarea>
-      <div style="display:flex; gap:8px; margin-top:8px;">
-        <button class="primary" id="speakBtn" onclick="speakText()" style="margin-top:0;">
-          <i class="fa-solid fa-volume-high"></i> Speak
-        </button>
-        <button class="primary" id="stopSpeakBtn" onclick="stopSpeaking()" style="margin-top:0; background:#0b1120; color:var(--gold); border:1px solid var(--panel-border);">
-          Stop
-        </button>
-      </div>
-      <button class="primary" style="margin-top:8px; background:#0b1120; color:var(--gold); border:1px solid var(--panel-border);" onclick="useTranslationResultForSpeech()">
-        Use last translation result ↑
-      </button>
-    </div>
-  </div>
-</div>
+def _store_path(lang_a: str, lang_b: str) -> Path:
+    return VECTORSTORE_DIR / _pair_slug(lang_a, lang_b)
 
-<script>
-// Hardcoded from the PHP side — no user input needed.
-const API_BASE = <?php echo json_encode(rtrim($SALINGO_API_BASE, '/')); ?>;
-let lastTranslationText = '';
 
-function onLangSelectChange(selectId, customId) {
-  const select = document.getElementById(selectId);
-  const custom = document.getElementById(customId);
-  custom.style.display = select.value === '__custom__' ? 'block' : 'none';
-}
+def _embeddings_file(store_path: Path) -> Path:
+    return store_path / "embeddings.npy"
 
-function getLangValue(selectId, customId) {
-  const select = document.getElementById(selectId);
-  if (select.value === '__custom__') {
-    return document.getElementById(customId).value.trim();
-  }
-  return select.value;
-}
 
-function swapLangs() {
-  const fromSel = document.getElementById('fromLang');
-  const toSel = document.getElementById('toLang');
-  const tmp = fromSel.value;
-  fromSel.value = toSel.value;
-  toSel.value = tmp;
-  onLangSelectChange('fromLang', 'fromLangCustom');
-  onLangSelectChange('toLang', 'toLangCustom');
-}
+def _metadata_file(store_path: Path) -> Path:
+    return store_path / "metadata.json"
 
-async function checkHealth() {
-  const el = document.getElementById('healthStatus');
-  el.innerText = 'checking...';
-  try {
-    const res = await fetch(API_BASE + '/health');
-    if (res.ok) {
-      el.innerText = '● online';
-      el.style.color = '#3ddc84';
-    } else {
-      el.innerText = '● error ' + res.status;
-      el.style.color = '#ff5d5d';
-    }
-  } catch (e) {
-    el.innerText = '● unreachable (service may be waking up, try again in a moment)';
-    el.style.color = '#ff5d5d';
-  }
-}
 
-async function doTranslate() {
-  const fromLang = getLangValue('fromLang', 'fromLangCustom');
-  const toLang = getLangValue('toLang', 'toLangCustom');
-  const text = document.getElementById('translateText').value.trim();
-  const resultEl = document.getElementById('translateResult');
-  const btn = document.getElementById('translateBtn');
+def _info_file(store_path: Path) -> Path:
+    return store_path / "info.json"
 
-  if (!fromLang || !toLang || !text) {
-    resultEl.style.display = 'block';
-    resultEl.className = 'result err';
-    resultEl.innerText = 'Please select both languages and enter text.';
-    return;
-  }
-  if (fromLang.toLowerCase() === toLang.toLowerCase()) {
-    resultEl.style.display = 'block';
-    resultEl.className = 'result err';
-    resultEl.innerText = '"From" and "To" languages must be different.';
-    return;
-  }
 
-  btn.disabled = true;
-  btn.innerText = 'Translating...';
-  resultEl.style.display = 'block';
-  resultEl.className = 'result';
-  resultEl.innerText = 'Translating (this may take up to a minute if the service was asleep)...';
+# ---------------------------------------------------------------------
+# Parsing: CSV / XLSX (tabular, two language columns)
+# ---------------------------------------------------------------------
 
-  try {
-    const res = await fetch(API_BASE + '/translate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, language: fromLang, target_language: toLang })
-    });
-    const data = await res.json();
+def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, str]:
+    cols = [str(c).strip().lower() for c in df.columns]
+    df.columns = cols
 
-    if (!res.ok) {
-      resultEl.className = 'result err';
-      resultEl.innerText = data.detail || 'Translation failed.';
-    } else {
-      resultEl.className = 'result ok';
-      resultEl.innerText = data.translation;
-      lastTranslationText = data.translation;
-      const meta = document.createElement('div');
-      meta.className = 'meta';
-      meta.innerText = `Examples used from translation memory: ${data.examples_used} · Trained: ${data.trained ? 'yes' : 'no (using base model knowledge)'}`;
-      resultEl.appendChild(meta);
-    }
-  } catch (e) {
-    resultEl.className = 'result err';
-    resultEl.innerText = 'Could not reach the translation service: ' + e.message;
-  } finally {
-    btn.disabled = false;
-    btn.innerText = 'Translate';
-  }
-}
+    a_col = lang_a.strip().lower() if lang_a.strip().lower() in cols else None
+    b_col = lang_b.strip().lower() if lang_b.strip().lower() in cols else None
 
-// ---------------------------------------------------------------------
-// Speech: language select behavior (warn if Kapampangan picked — no
-// browser/OS ships a speech engine for it)
-// ---------------------------------------------------------------------
-document.getElementById('speechLang').addEventListener('change', function () {
-  document.getElementById('kapampanganNote').style.display =
-    this.value === '__kapampangan__' ? 'block' : 'none';
-});
+    # Backward-compatible fallback for the old "english"/"en" convention.
+    if b_col is None and lang_b.strip().lower() == "english":
+        b_col = next((c for c in ("english", "en") if c in cols), None)
+    if a_col is None and lang_a.strip().lower() == "english":
+        a_col = next((c for c in ("english", "en") if c in cols), None)
 
-// ---------------------------------------------------------------------
-// Prevent picking the same language for "Speak" and "Translate" in the
-// Speech-to-Text card.
-// ---------------------------------------------------------------------
-function validateSpeechLangs() {
-  const speakLang = document.getElementById('speakLang').value;
-  const toLang = document.getElementById('speechToLang').value;
-  const warningEl = document.getElementById('speechLangWarning');
-  const micBtn = document.getElementById('micBtn');
-  const same = speakLang.toLowerCase() === toLang.toLowerCase();
+    if a_col is None or b_col is None:
+        if len(cols) < 2:
+            raise ValueError(f"File must have at least 2 columns, got: {df.columns.tolist()}")
+        a_col = a_col or cols[0]
+        b_col = b_col or cols[1]
 
-  warningEl.style.display = same ? 'block' : 'none';
-  micBtn.disabled = same;
-  return !same;
-}
+    return a_col, b_col
 
-// ---------------------------------------------------------------------
-// Speech → Text → Translation (records audio, sends to Gemini via our
-// backend — works for ANY language, including Kapampangan, unlike the
-// browser's built-in SpeechRecognition which has no Kapampangan support)
-// ---------------------------------------------------------------------
-let mediaRecorder = null;
-let audioChunks = [];
-let isRecording = false;
 
-async function toggleRecording() {
-  const micBtn = document.getElementById('micBtn');
-  const resultEl = document.getElementById('sttResult');
+def _pairs_from_dataframe(df: pd.DataFrame, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+    if df.empty:
+        return []
+    a_col, b_col = _detect_columns(df, lang_a, lang_b)
 
-  if (isRecording) {
-    mediaRecorder.stop();
-    return;
-  }
+    pairs = []
+    for _, row in df.iterrows():
+        a_text = str(row.get(a_col, "")).strip()
+        b_text = str(row.get(b_col, "")).strip()
+        if a_text and b_text and a_text.lower() != "nan" and b_text.lower() != "nan":
+            pairs.append((a_text, b_text))
+    return pairs
 
-  if (!validateSpeechLangs()) {
-    return;
-  }
 
-  if (!navigator.mediaDevices || !window.MediaRecorder) {
-    resultEl.style.display = 'block';
-    resultEl.className = 'result err';
-    resultEl.innerText = 'Microphone recording is not supported in this browser.';
-    return;
-  }
+def _pairs_from_csv(csv_path: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    return _pairs_from_dataframe(df, lang_a, lang_b)
 
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (e) {
-    resultEl.style.display = 'block';
-    resultEl.className = 'result err';
-    resultEl.innerText = 'Microphone access was denied or unavailable: ' + e.message;
-    return;
-  }
 
-  audioChunks = [];
-  mediaRecorder = new MediaRecorder(stream);
+def _pairs_from_xlsx(xlsx_path: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+    df = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl")
+    df = df.fillna("")
+    return _pairs_from_dataframe(df, lang_a, lang_b)
 
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data.size > 0) audioChunks.push(e.data);
-  };
 
-  mediaRecorder.onstart = () => {
-    isRecording = true;
-    micBtn.innerHTML = '<i class="fa-solid fa-stop"></i> Stop recording';
-    resultEl.style.display = 'block';
-    resultEl.className = 'result';
-    resultEl.innerText = 'Recording... click "Stop recording" when done.';
-  };
+# ---------------------------------------------------------------------
+# Parsing: PDF glossary (best-effort — glossary layouts vary a lot)
+# ---------------------------------------------------------------------
 
-  mediaRecorder.onstop = async () => {
-    isRecording = false;
-    micBtn.innerHTML = '<i class="fa-solid fa-microphone"></i> Start recording';
-    stream.getTracks().forEach((t) => t.stop());
+_GLOSSARY_LINE_RE = re.compile(
+    r"^\s*(?P<source>.+?)\s*(?:[-–—:]|\t|\s{3,})\s*(?P<target>.+?)\s*$"
+)
 
-    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-    await sendAudioForTranslation(audioBlob);
-  };
 
-  mediaRecorder.start();
-}
+def _pairs_from_pdf(pdf_path: str) -> list[tuple[str, str]]:
+    reader = PdfReader(pdf_path)
+    pairs = []
 
-async function sendAudioForTranslation(audioBlob) {
-  const resultEl = document.getElementById('sttResult');
-  const sttTranslationResultEl = document.getElementById('sttTranslationResult');
-  const fromLang = document.getElementById('speakLang').value;
-  const toLang = document.getElementById('speechToLang').value;
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = _GLOSSARY_LINE_RE.match(line)
+            if not match:
+                continue
+            source = match.group("source").strip()
+            target = match.group("target").strip()
+            if not source or not target:
+                continue
+            if source.replace(" ", "").isdigit() or target.replace(" ", "").isdigit():
+                continue
+            pairs.append((source, target))
 
-  resultEl.className = 'result';
-  resultEl.innerText = 'Transcribing and translating audio (this can take a bit)...';
-  sttTranslationResultEl.value = '';
+    return pairs
 
-  const form = new FormData();
-  form.append('audio', audioBlob, 'recording.webm');
-  form.append('source_language', fromLang);
-  form.append('target_language', toLang);
 
-  try {
-    const res = await fetch(API_BASE + '/translate-audio', { method: 'POST', body: form });
-    const data = await res.json();
+# ---------------------------------------------------------------------
+# Embedding storage
+# ---------------------------------------------------------------------
 
-    if (!res.ok) {
-      resultEl.className = 'result err';
-      resultEl.innerText = data.detail || 'Audio translation failed.';
-      return;
+def _embed_texts(texts: list[str]) -> np.ndarray:
+    client = get_client()
+    vectors = []
+    for i in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[i : i + EMBEDDING_BATCH_SIZE]
+        resp = client.models.embed_content(
+            model=EMBEDDING_MODEL,
+            contents=batch,
+            config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
+        )
+        vectors.extend([e.values for e in resp.embeddings])
+    return np.array(vectors, dtype=np.float32)
+
+
+def _load_store(store_path: Path) -> tuple[np.ndarray, list[dict]]:
+    embeddings = np.load(_embeddings_file(store_path))
+    with open(_metadata_file(store_path), "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    return embeddings, metadata
+
+
+def _save_store(store_path: Path, embeddings: np.ndarray, metadata: list[dict]):
+    store_path.mkdir(parents=True, exist_ok=True)
+    np.save(_embeddings_file(store_path), embeddings)
+    with open(_metadata_file(store_path), "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False)
+
+
+def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict:
+    """
+    Ingest a CSV, XLSX, or PDF dataset and add it to the (lang_a <-> lang_b)
+    translation memory. Creates the store if it doesn't exist, or merges
+    into it.
+
+    Returns: {"success": bool, "count": int, "message": str}
+    """
+    ext = Path(file_path).suffix.lower()
+
+    try:
+        if ext == ".csv":
+            pairs = _pairs_from_csv(file_path, lang_a, lang_b)
+        elif ext in (".xlsx", ".xlsm"):
+            pairs = _pairs_from_xlsx(file_path, lang_a, lang_b)
+        elif ext == ".pdf":
+            pairs = _pairs_from_pdf(file_path)
+        else:
+            return {"success": False, "count": 0, "message": f"Unsupported file type: {ext}"}
+    except Exception as e:
+        return {"success": False, "count": 0, "message": f"Could not read file: {e}"}
+
+    if not pairs:
+        return {
+            "success": False,
+            "count": 0,
+            "message": (
+                f"No valid '{lang_a}' / '{lang_b}' sentence pairs found in the file. "
+                "Make sure it has two columns — one per language — with matching translations "
+                "in each row (not just single-language word lists or tagging data)."
+            ),
+        }
+
+    texts: list[str] = []
+    metadata: list[dict] = []
+    for a_text, b_text in pairs:
+        texts.append(a_text)
+        metadata.append(
+            {"source_lang": lang_a, "target_lang": lang_b, "source_text": a_text, "target_text": b_text}
+        )
+        texts.append(b_text)
+        metadata.append(
+            {"source_lang": lang_b, "target_lang": lang_a, "source_text": b_text, "target_text": a_text}
+        )
+
+    try:
+        new_embeddings = _embed_texts(texts)
+    except Exception as e:
+        return {"success": False, "count": 0, "message": f"Embedding request failed: {e}"}
+
+    store_path = _store_path(lang_a, lang_b)
+    if _embeddings_file(store_path).exists():
+        existing_embeddings, existing_metadata = _load_store(store_path)
+        all_embeddings = np.vstack([existing_embeddings, new_embeddings])
+        all_metadata = existing_metadata + metadata
+    else:
+        all_embeddings = new_embeddings
+        all_metadata = metadata
+
+    _save_store(store_path, all_embeddings, all_metadata)
+    with open(_info_file(store_path), "w", encoding="utf-8") as f:
+        json.dump({"lang_a": lang_a, "lang_b": lang_b}, f, ensure_ascii=False)
+
+    return {
+        "success": True,
+        "count": len(pairs),
+        "message": f"Trained on {len(pairs)} pairs for '{lang_a}' <-> '{lang_b}' (from {ext} file).",
     }
 
-    resultEl.className = 'result ok';
-    resultEl.innerText = `Heard (${fromLang}): "${data.transcript}"`;
 
-    // Result shows up right away in the Speech-to-Text card's own box.
-    sttTranslationResultEl.value = data.translation;
-    lastTranslationText = data.translation;
-  } catch (e) {
-    resultEl.className = 'result err';
-    resultEl.innerText = 'Could not reach the translation service: ' + e.message;
-  }
-}
+def language_pair_is_trained(lang_a: str, lang_b: str) -> bool:
+    return _embeddings_file(_store_path(lang_a, lang_b)).exists()
 
-// ---------------------------------------------------------------------
-// Text → Speech (Web Speech API — browser/OS built-in, no server call)
-// ---------------------------------------------------------------------
-function speakText() {
-  const text = document.getElementById('ttsText').value.trim();
-  const langSelect = document.getElementById('speechLang');
 
-  if (langSelect.value === '__kapampangan__') {
-    alert('No browser or OS ships a Kapampangan voice yet, so this text cannot be spoken aloud.');
-    return;
-  }
-  if (!text) {
-    alert('Type some text first, or click "Use last translation result".');
-    return;
-  }
-  if (!('speechSynthesis' in window)) {
-    alert('Text-to-speech is not supported in this browser.');
-    return;
-  }
+def list_trained_languages() -> list[str]:
+    """Returns human-readable pair labels, e.g. ['Kapampangan ↔ Tagalog', 'Tagalog ↔ English']."""
+    if not VECTORSTORE_DIR.exists():
+        return []
+    labels = []
+    for p in VECTORSTORE_DIR.iterdir():
+        if not (p.is_dir() and _embeddings_file(p).exists()):
+            continue
+        info_path = _info_file(p)
+        if info_path.exists():
+            with open(info_path, "r", encoding="utf-8") as f:
+                info = json.load(f)
+            labels.append(f"{info['lang_a']} ↔ {info['lang_b']}")
+        else:
+            labels.append(p.name.replace("__", " ↔ "))
+    return labels
 
-  window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = langSelect.value;
-  window.speechSynthesis.speak(utterance);
-}
 
-function stopSpeaking() {
-  if ('speechSynthesis' in window) {
-    window.speechSynthesis.cancel();
-  }
-}
+def delete_language_pair(lang_a: str, lang_b: str) -> bool:
+    path = _store_path(lang_a, lang_b)
+    if path.exists():
+        shutil.rmtree(path)
+        return True
+    return False
 
-function useTranslationResultForSpeech() {
-  if (!lastTranslationText) {
-    alert('No translation result yet — translate something first.');
-    return;
-  }
-  document.getElementById('ttsText').value = lastTranslationText;
-}
 
-checkHealth();
-validateSpeechLangs();
-</script>
-</body>
-</html>
+# ---------------------------------------------------------------------
+# Translation
+# ---------------------------------------------------------------------
+
+def _cosine_top_k(query_vec: np.ndarray, matrix: np.ndarray, k: int) -> list[int]:
+    if matrix.shape[0] == 0:
+        return []
+    query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-10)
+    matrix_norm = matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-10)
+    scores = matrix_norm @ query_norm
+    top_k = min(k, len(scores))
+    return list(np.argsort(-scores)[:top_k])
+
+
+def _format_examples(examples: list[dict]) -> str:
+    if not examples:
+        return "(no matching examples found)"
+    return "\n".join(
+        f"- Source: {e['source_text']}\n  Target: {e['target_text']}" for e in examples
+    )
+
+
+def translate_text(
+    text: str,
+    source_language: str,
+    target_language: str = "English",
+    k: int = 4,
+) -> dict:
+    """
+    Translate `text` from `source_language` into `target_language`.
+    Works for ANY language pair (e.g. Kapampangan -> Tagalog), not just
+    a fixed "-> English" direction.
+    """
+    store_path = _store_path(source_language, target_language)
+    examples: list[dict] = []
+    trained = _embeddings_file(store_path).exists()
+
+    if trained:
+        embeddings, metadata = _load_store(store_path)
+        direction_indices = [
+            i for i, m in enumerate(metadata)
+            if m["source_lang"].strip().lower() == source_language.strip().lower()
+            and m["target_lang"].strip().lower() == target_language.strip().lower()
+        ]
+
+        if direction_indices:
+            sub_matrix = embeddings[direction_indices]
+            query_vec = _embed_texts([text])[0]
+            top_local = _cosine_top_k(query_vec, sub_matrix, k)
+            examples = [metadata[direction_indices[i]] for i in top_local]
+
+    system_prompt = (
+        f"You are a professional translator working from '{source_language}' into "
+        f"'{target_language}'. Use the example translations below (retrieved from a "
+        "verified translation memory) to match terminology, tone, and phrasing. If no "
+        "examples are relevant, translate using your own knowledge of both languages. "
+        "Respond with ONLY the translated text — no explanations, no quotes, no extra "
+        "commentary.\n\nExamples:\n" + _format_examples(examples)
+    )
+    user_prompt = f"Translate this text from {source_language} into {target_language}:\n\n{text}"
+
+    client = get_client()
+    response = client.models.generate_content(
+        model=CHAT_MODEL,
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.2,
+        ),
+    )
+
+    translation = response.text.strip()
+
+    return {
+        "translation": translation,
+        "examples_used": len(examples),
+        "trained": trained,
+    }
