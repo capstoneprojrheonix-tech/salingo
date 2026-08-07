@@ -142,8 +142,28 @@ def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, st
     if a_col is None or b_col is None:
         if len(cols) < 2:
             raise ValueError(f"File must have at least 2 columns, got: {df.columns.tolist()}")
-        a_col = a_col or cols[0]
-        b_col = b_col or cols[1]
+
+        # Only guess positionally when there's no real ambiguity — i.e. the
+        # file has EXACTLY 2 columns, so there's nothing else it could mean.
+        # With 3+ columns (like ID/English/Tagalog/Kapampangan), guessing
+        # would silently read the wrong column (e.g. an ID column) as if it
+        # were sentence text. Fail loudly instead so the mistake is obvious
+        # immediately, not buried in bad training data.
+        if len(cols) == 2:
+            a_col = a_col or cols[0]
+            b_col = b_col or cols[1]
+        else:
+            missing = []
+            if a_col is None:
+                missing.append(lang_a)
+            if b_col is None:
+                missing.append(lang_b)
+            raise ValueError(
+                f"Could not find a column matching {missing} in this file. "
+                f"Available columns: {df.columns.tolist()}. "
+                "The language name you typed must exactly match one of the column "
+                "headers (case-insensitive) — check for typos or extra spaces."
+            )
 
     return a_col, b_col
 
