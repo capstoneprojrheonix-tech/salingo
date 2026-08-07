@@ -23,8 +23,8 @@ import os
 import re
 import json
 import shutil
+import tempfile
 import uuid
-import itertools
 from pathlib import Path
 from typing import Optional
 
@@ -48,6 +48,43 @@ CHAT_MODEL = "gemini-3.5-flash"
 EMBEDDING_BATCH_SIZE = 100
 MAX_AUDIO_EXAMPLES_PER_REQUEST = 5  # how many reference clips to feed Gemini per transcription
 MAX_AUDIO_SAMPLE_BYTES = 5 * 1024 * 1024  # 5 MB cap per training clip
+
+# TTS (voice cloning) — reuses the same audio_training/<language>/ samples
+# collected by train_audio_sample(), but as reference voice for synthesis
+# instead of as few-shot calibration for transcription.
+MIN_TTS_REFERENCE_SECONDS = 3  # a clip shorter than this is too short to clone a voice from
+XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
+XTTS_LANGUAGE_FALLBACK = {
+    # XTTS doesn't know "Kapampangan" as a language code — it has no
+    # dedicated phoneme set for it. We pass the closest supported code
+    # so the model's text-to-phoneme step doesn't error out; the actual
+    # voice timbre/accent still comes from the reference clip itself.
+    "kapampangan": "tl",
+    "tagalog": "tl",
+    "filipino": "tl",
+    "english": "en",
+}
+
+_tts_model = None
+
+
+def _get_tts_model():
+    """
+    Lazily loads the Coqui XTTS v2 model. This is intentionally NOT loaded
+    at import time — it's a large model (needs a few GB of RAM/VRAM) and
+    most deployments of this service (e.g. a small Render instance) won't
+    want to pay that cost unless /synthesize-speech is actually called.
+
+    Requires: pip install TTS
+    In production, this model should run on its own worker with a GPU
+    (or at least several CPU cores) — training/inference here is far
+    heavier than the Gemini API calls used elsewhere in this file.
+    """
+    global _tts_model
+    if _tts_model is None:
+        from TTS.api import TTS  # local import: optional heavy dependency
+        _tts_model = TTS(XTTS_MODEL_NAME)
+    return _tts_model
 
 _client = None
 
@@ -86,79 +123,54 @@ def _info_file(store_path: Path) -> Path:
 
 
 # ---------------------------------------------------------------------
-# Parsing: CSV / XLSX (tabular — ANY number of language columns)
+# Parsing: CSV / XLSX (tabular, two language columns)
 # ---------------------------------------------------------------------
-# Instead of only reading two fixed columns, every column that doesn't
-# look like an ID/index column is treated as a language column (using its
-# header as the language name), and a training pair is built for every
-# 2-column combination found — e.g. a sheet with English, Tagalog, and
-# Kapampangan columns yields English↔Tagalog, English↔Kapampangan, and
-# Tagalog↔Kapampangan pairs, all from a single upload.
 
-_ID_COLUMN_NAME_RE = re.compile(r"^(id|no\.?|num(ber)?|#|index|row)$", re.IGNORECASE)
+def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, str]:
+    cols = [str(c).strip().lower() for c in df.columns]
+    df.columns = cols
 
+    a_col = lang_a.strip().lower() if lang_a.strip().lower() in cols else None
+    b_col = lang_b.strip().lower() if lang_b.strip().lower() in cols else None
 
-def _is_id_like_column(col_name, series: pd.Series) -> bool:
-    if _ID_COLUMN_NAME_RE.match(str(col_name).strip()):
-        return True
+    # Backward-compatible fallback for the old "english"/"en" convention.
+    if b_col is None and lang_b.strip().lower() == "english":
+        b_col = next((c for c in ("english", "en") if c in cols), None)
+    if a_col is None and lang_a.strip().lower() == "english":
+        a_col = next((c for c in ("english", "en") if c in cols), None)
 
-    values = [str(v).strip() for v in series if str(v).strip() and str(v).strip().lower() != "nan"]
-    if not values:
-        return True  # fully empty column — not usable as a language column
+    if a_col is None or b_col is None:
+        if len(cols) < 2:
+            raise ValueError(f"File must have at least 2 columns, got: {df.columns.tolist()}")
+        a_col = a_col or cols[0]
+        b_col = b_col or cols[1]
 
-    # If every non-empty value is a plain integer, it's almost certainly an
-    # auto-numbered index column, not translated text.
-    return all(v.lstrip("-").isdigit() for v in values)
-
-
-def _detect_language_columns(df: pd.DataFrame) -> list:
-    return [col for col in df.columns if not _is_id_like_column(col, df[col])]
+    return a_col, b_col
 
 
-def _all_pairs_from_dataframe(df: pd.DataFrame) -> dict[tuple[str, str], list[tuple[str, str]]]:
-    """
-    Returns {(lang_x, lang_y): [(text_x, text_y), ...]} for every pairwise
-    combination of detected language columns, using the original column
-    headers (trimmed) as the language names.
-    """
+def _pairs_from_dataframe(df: pd.DataFrame, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
     if df.empty:
-        return {}
+        return []
+    a_col, b_col = _detect_columns(df, lang_a, lang_b)
 
-    lang_cols = _detect_language_columns(df)
-    if len(lang_cols) < 2:
-        return {}
-
-    result: dict[tuple[str, str], list[tuple[str, str]]] = {}
-    for col_x, col_y in itertools.combinations(lang_cols, 2):
-        pairs = []
-        for _, row in df.iterrows():
-            x_text = str(row.get(col_x, "")).strip()
-            y_text = str(row.get(col_y, "")).strip()
-            if x_text and y_text and x_text.lower() != "nan" and y_text.lower() != "nan":
-                pairs.append((x_text, y_text))
-        if pairs:
-            result[(str(col_x).strip(), str(col_y).strip())] = pairs
-    return result
+    pairs = []
+    for _, row in df.iterrows():
+        a_text = str(row.get(a_col, "")).strip()
+        b_text = str(row.get(b_col, "")).strip()
+        if a_text and b_text and a_text.lower() != "nan" and b_text.lower() != "nan":
+            pairs.append((a_text, b_text))
+    return pairs
 
 
-def _all_pairs_from_csv(csv_path: str) -> dict[tuple[str, str], list[tuple[str, str]]]:
+def _pairs_from_csv(csv_path: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
     df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
-    return _all_pairs_from_dataframe(df)
+    return _pairs_from_dataframe(df, lang_a, lang_b)
 
 
-def _all_pairs_from_xlsx(xlsx_path: str) -> dict[tuple[str, str], list[tuple[str, str]]]:
-    # sheet_name=None loads every sheet as {sheet_name: DataFrame}, instead
-    # of silently defaulting to just the first sheet — some exports (e.g.
-    # FAQ workbooks) split content across multiple sheets like
-    # "Questions" / "Answers".
-    sheets = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl", sheet_name=None)
-
-    combined: dict[tuple[str, str], list[tuple[str, str]]] = {}
-    for sheet_df in sheets.values():
-        sheet_df = sheet_df.fillna("")
-        for combo, pairs in _all_pairs_from_dataframe(sheet_df).items():
-            combined.setdefault(combo, []).extend(pairs)
-    return combined
+def _pairs_from_xlsx(xlsx_path: str, lang_a: str, lang_b: str) -> list[tuple[str, str]]:
+    df = pd.read_excel(xlsx_path, dtype=str, engine="openpyxl")
+    df = df.fillna("")
+    return _pairs_from_dataframe(df, lang_a, lang_b)
 
 
 # ---------------------------------------------------------------------
@@ -226,10 +238,38 @@ def _save_store(store_path: Path, embeddings: np.ndarray, metadata: list[dict]):
         json.dump(metadata, f, ensure_ascii=False)
 
 
-def _train_pairs_into_store(lang_a: str, lang_b: str, pairs: list[tuple[str, str]]) -> int:
-    """Embed `pairs` and merge them into the (lang_a <-> lang_b) store. Returns count added."""
+def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict:
+    """
+    Ingest a CSV, XLSX, or PDF dataset and add it to the (lang_a <-> lang_b)
+    translation memory. Creates the store if it doesn't exist, or merges
+    into it.
+
+    Returns: {"success": bool, "count": int, "message": str}
+    """
+    ext = Path(file_path).suffix.lower()
+
+    try:
+        if ext == ".csv":
+            pairs = _pairs_from_csv(file_path, lang_a, lang_b)
+        elif ext in (".xlsx", ".xlsm"):
+            pairs = _pairs_from_xlsx(file_path, lang_a, lang_b)
+        elif ext == ".pdf":
+            pairs = _pairs_from_pdf(file_path)
+        else:
+            return {"success": False, "count": 0, "message": f"Unsupported file type: {ext}"}
+    except Exception as e:
+        return {"success": False, "count": 0, "message": f"Could not read file: {e}"}
+
     if not pairs:
-        return 0
+        return {
+            "success": False,
+            "count": 0,
+            "message": (
+                f"No valid '{lang_a}' / '{lang_b}' sentence pairs found in the file. "
+                "Make sure it has two columns — one per language — with matching translations "
+                "in each row (not just single-language word lists or tagging data)."
+            ),
+        }
 
     texts: list[str] = []
     metadata: list[dict] = []
@@ -243,7 +283,10 @@ def _train_pairs_into_store(lang_a: str, lang_b: str, pairs: list[tuple[str, str
             {"source_lang": lang_b, "target_lang": lang_a, "source_text": b_text, "target_text": a_text}
         )
 
-    new_embeddings = _embed_texts(texts)
+    try:
+        new_embeddings = _embed_texts(texts)
+    except Exception as e:
+        return {"success": False, "count": 0, "message": f"Embedding request failed: {e}"}
 
     store_path = _store_path(lang_a, lang_b)
     if _embeddings_file(store_path).exists():
@@ -258,77 +301,11 @@ def _train_pairs_into_store(lang_a: str, lang_b: str, pairs: list[tuple[str, str
     with open(_info_file(store_path), "w", encoding="utf-8") as f:
         json.dump({"lang_a": lang_a, "lang_b": lang_b}, f, ensure_ascii=False)
 
-    return len(pairs)
-
-
-def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict:
-    """
-    Ingest a CSV, XLSX, or PDF dataset into the translation memory.
-
-    For CSV/XLSX files, EVERY language column found in the file (any
-    column that isn't an ID/index column) is used — not just two fixed
-    ones. A separate trained (bidirectional) pair is created for every
-    2-column combination, e.g. a sheet with English, Tagalog, and
-    Kapampangan columns yields English↔Tagalog, English↔Kapampangan, and
-    Tagalog↔Kapampangan pairs from a single upload.
-
-    `lang_a`/`lang_b` are used as the pair for PDF glossaries only, since
-    those are parsed line-by-line as strictly two-column (source/target).
-
-    Returns: {"success": bool, "count": int, "message": str}
-    """
-    ext = Path(file_path).suffix.lower()
-
-    try:
-        if ext == ".csv":
-            pairs_by_combo = _all_pairs_from_csv(file_path)
-        elif ext in (".xlsx", ".xlsm"):
-            pairs_by_combo = _all_pairs_from_xlsx(file_path)
-        elif ext == ".pdf":
-            pdf_pairs = _pairs_from_pdf(file_path)
-            pairs_by_combo = {(lang_a, lang_b): pdf_pairs} if pdf_pairs else {}
-        else:
-            return {"success": False, "count": 0, "message": f"Unsupported file type: {ext}"}
-    except Exception as e:
-        return {"success": False, "count": 0, "message": f"Could not read file: {e}"}
-
-    pairs_by_combo = {combo: p for combo, p in pairs_by_combo.items() if p}
-
-    if not pairs_by_combo:
-        return {
-            "success": False,
-            "count": 0,
-            "message": (
-                "No valid sentence pairs found in the file. Make sure it has at least two "
-                "language columns — one per language — with matching translations in each "
-                "row (not just single-language word lists or tagging data)."
-            ),
-        }
-
-    total_count = 0
-    trained_summaries = []
-    errors = []
-    for (col_a, col_b), pairs in pairs_by_combo.items():
-        try:
-            count = _train_pairs_into_store(col_a, col_b, pairs)
-        except Exception as e:
-            errors.append(f"{col_a} <-> {col_b}: {e}")
-            continue
-        total_count += count
-        trained_summaries.append(f"{col_a} ↔ {col_b} ({count})")
-
-    if total_count == 0:
-        return {
-            "success": False,
-            "count": 0,
-            "message": "Training failed for all detected language pairs: " + "; ".join(errors),
-        }
-
-    message = f"Trained on {total_count} pairs from {ext} file: " + ", ".join(trained_summaries)
-    if errors:
-        message += f". Some pairs failed: {'; '.join(errors)}"
-
-    return {"success": True, "count": total_count, "message": message}
+    return {
+        "success": True,
+        "count": len(pairs),
+        "message": f"Trained on {len(pairs)} pairs for '{lang_a}' <-> '{lang_b}' (from {ext} file).",
+    }
 
 
 def language_pair_is_trained(lang_a: str, lang_b: str) -> bool:
@@ -568,6 +545,95 @@ def _load_audio_examples(language: str, max_examples: int = MAX_AUDIO_EXAMPLES_P
 
 
 
+def _pick_reference_clip(language: str) -> Optional[Path]:
+    """
+    Picks the best available reference clip for voice cloning: the most
+    recently added sample for this language, since newer samples are
+    likely to have been recorded with the current mic/setup in mind.
+    """
+    lang_dir = _audio_lang_dir(language)
+    metadata = _load_audio_metadata(lang_dir)
+    if not metadata:
+        return None
+
+    for m in reversed(metadata):  # most recent first
+        candidate = lang_dir / m["filename"]
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def synthesize_speech(text: str, language: str) -> dict:
+    """
+    Synthesize `text` spoken in `language`, cloning the voice from the
+    trained pronunciation samples in audio_training/<language>/ (the
+    same samples collected by train_audio_sample() for STT calibration).
+
+    This is how languages with no OS/browser TTS voice (e.g. Kapampangan)
+    can still be "spoken" — the voice comes from real recorded samples of
+    a speaker of that language, not from a pre-built system voice.
+
+    Returns: {"success": bool, "audio": bytes | None, "mime_type": str,
+              "message": str}
+    """
+    text = text.strip()
+    if not text:
+        return {"success": False, "audio": None, "mime_type": "", "message": "No text to speak."}
+
+    reference_clip = _pick_reference_clip(language)
+    if reference_clip is None:
+        return {
+            "success": False,
+            "audio": None,
+            "mime_type": "",
+            "message": (
+                f"No voice samples trained for '{language}' yet. Record a few short, clear "
+                "clips via the pronunciation trainer first — even 3-5 short samples from one "
+                "speaker are enough to clone a voice from."
+            ),
+        }
+
+    xtts_lang = XTTS_LANGUAGE_FALLBACK.get(language.strip().lower(), "en")
+
+    try:
+        model = _get_tts_model()
+    except Exception as e:
+        return {
+            "success": False,
+            "audio": None,
+            "mime_type": "",
+            "message": f"TTS engine unavailable: {e}",
+        }
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    out_path = tmp_dir / "speech.wav"
+    try:
+        model.tts_to_file(
+            text=text,
+            speaker_wav=str(reference_clip),
+            language=xtts_lang,
+            file_path=str(out_path),
+        )
+        with open(out_path, "rb") as f:
+            audio_bytes = f.read()
+    except Exception as e:
+        return {
+            "success": False,
+            "audio": None,
+            "mime_type": "",
+            "message": f"Speech synthesis failed: {e}",
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return {
+        "success": True,
+        "audio": audio_bytes,
+        "mime_type": "audio/wav",
+        "message": "ok",
+    }
+
+
 def _transcribe_audio(
     file_path: str,
     mime_type: str,
@@ -656,4 +722,4 @@ def transcribe_and_translate_audio(
         "examples_used": result["examples_used"],
         "trained": result["trained"],
         "pronunciation_samples_used": len(reference_examples),
-        }
+    }
