@@ -134,6 +134,43 @@ def translate_audio(
     return result
 
 
+@app.post("/train-audio")
+def train_audio(
+    language: str = Form(...),
+    transcript: str = Form(...),
+    audio: UploadFile = File(...),
+):
+    mime_type = audio.content_type or "audio/webm"
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    tmp_path = tmp_dir / (audio.filename or "sample.webm")
+    try:
+        with open(tmp_path, "wb") as f:
+            shutil.copyfileobj(audio.file, f)
+
+        result = agent.train_audio_sample(language, str(tmp_path), mime_type, transcript)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if not result["success"]:
+        raise HTTPException(400, result["message"])
+
+    return result
+
+
+@app.get("/audio-samples")
+def audio_samples(language: str):
+    return {"language": language, "samples": agent.list_audio_samples(language)}
+
+
+@app.delete("/audio-samples")
+def delete_audio_sample(language: str, sample_id: str):
+    deleted = agent.delete_audio_sample(language, sample_id)
+    if not deleted:
+        raise HTTPException(404, "Pronunciation sample not found")
+    return {"success": True, "message": "Pronunciation sample deleted"}
+
+
 @app.delete("/languages")
 def delete_language_pair(language: str, target_language: str = "English"):
     deleted = agent.delete_language_pair(language, target_language)
