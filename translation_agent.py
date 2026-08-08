@@ -159,14 +159,13 @@ def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, st
     Figures out which two columns hold `lang_a` and `lang_b` text.
 
     Returns (a_col, b_col, note). `note` is None when the columns were
-    matched by name, or a short human-readable explanation when Claude
-    had to guess positionally (e.g. the language name typed doesn't
-    match any header) — this is surfaced back in the training result
-    message so the person can double check it guessed right.
-
-    Design goal: the language name typed in Language Management should
-    NEVER have to exactly match a column header. Any file with at least
-    two non-ID columns can be trained.
+    matched with confidence — either by name, or because there was only
+    one possible column left to guess. When there's genuine ambiguity
+    (2+ equally-plausible columns and no name match to break the tie),
+    this raises a clear error instead of silently guessing — guessing
+    wrong here means silently training on the wrong language's data,
+    which is worse than asking the person to type a name that matches
+    a column header.
     """
     cols = [str(c).strip().lower() for c in df.columns]
     df.columns = cols
@@ -183,9 +182,6 @@ def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, st
     if a_col and b_col and a_col != b_col:
         return a_col, b_col, None
 
-    # No confident name match (or both names pointed at the same column)
-    # — fall back to best-effort guessing using whatever columns are left
-    # after excluding obvious ID/row-number columns.
     candidate_cols = [c for c in cols if not _looks_like_id_column(c)]
 
     if len(candidate_cols) < 2:
@@ -196,32 +192,46 @@ def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, st
 
     if a_col and not b_col:
         remaining = [c for c in candidate_cols if c != a_col]
-        b_col = remaining[0]
-        note = (
-            f"'{lang_b}' didn't match any column header, so the '{b_col}' "
-            f"column was used for it — double-check this is right."
+        if len(remaining) == 1:
+            b_col = remaining[0]
+            return a_col, b_col, None
+        raise ValueError(
+            f"'{lang_b}' didn't match any column header, and there's more than "
+            f"one column it could be ({remaining}) — too ambiguous to guess safely. "
+            f"Type '{lang_b}' to exactly match one of these column names, or "
+            f"rename the file's columns."
         )
-    elif b_col and not a_col:
+
+    if b_col and not a_col:
         remaining = [c for c in candidate_cols if c != b_col]
-        a_col = remaining[0]
-        note = (
-            f"'{lang_a}' didn't match any column header, so the '{a_col}' "
-            f"column was used for it — double-check this is right."
+        if len(remaining) == 1:
+            a_col = remaining[0]
+            return a_col, b_col, None
+        raise ValueError(
+            f"'{lang_a}' didn't match any column header, and there's more than "
+            f"one column it could be ({remaining}) — too ambiguous to guess safely. "
+            f"Type '{lang_a}' to exactly match one of these column names "
+            f"(e.g. one of {remaining}), or rename the file's columns."
         )
-    else:
-        # Neither language name matched anything in the file — best-effort
-        # positional guess using the first two usable columns, in the
-        # order they appear. This is what lets ANY file train, even one
-        # whose headers have nothing to do with the language name typed.
+
+    # Neither language name matched anything. Only safe to guess positionally
+    # when there are EXACTLY 2 usable columns total (nothing else it could
+    # mean). With 3+, silently picking the first two risks training the
+    # wrong pair, so ask instead.
+    if len(candidate_cols) == 2:
         a_col, b_col = candidate_cols[0], candidate_cols[1]
         note = (
             f"Neither '{lang_a}' nor '{lang_b}' matched a column header, so "
-            f"the first two usable columns ('{a_col}' and '{b_col}') were "
-            f"used — double-check this is right, or rename your file's "
-            f"columns to match if it picked the wrong ones."
+            f"the file's only two columns ('{a_col}' and '{b_col}') were used."
         )
+        return a_col, b_col, note
 
-    return a_col, b_col, note
+    raise ValueError(
+        f"Neither '{lang_a}' nor '{lang_b}' matched a column header, and this "
+        f"file has {len(candidate_cols)} possible language columns ({candidate_cols}) "
+        f"— too ambiguous to guess safely. Type language names that exactly match "
+        f"two of these column names."
+    )
 
 
 def _pairs_from_dataframe(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[list[tuple[str, str]], Optional[str]]:
