@@ -8,3 +8,5 @@ openpyxl
 numpy
 python-dotenv
 coqui-tts
+torch
+torchaudio
