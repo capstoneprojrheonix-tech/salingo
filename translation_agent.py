@@ -25,6 +25,7 @@ import json
 import shutil
 import tempfile
 import uuid
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -49,13 +50,13 @@ EMBEDDING_BATCH_SIZE = 100
 MAX_AUDIO_EXAMPLES_PER_REQUEST = 5  # how many reference clips to feed Gemini per transcription
 MAX_AUDIO_SAMPLE_BYTES = 5 * 1024 * 1024  # 5 MB cap per training clip
 
-# TTS (voice cloning) — reuses the same audio_training/<language>/ samples
+# TTS (voice cloning) â€” reuses the same audio_training/<language>/ samples
 # collected by train_audio_sample(), but as reference voice for synthesis
 # instead of as few-shot calibration for transcription.
 MIN_TTS_REFERENCE_SECONDS = 3  # a clip shorter than this is too short to clone a voice from
 XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 XTTS_LANGUAGE_FALLBACK = {
-    # XTTS doesn't know "Kapampangan" as a language code — it has no
+    # XTTS doesn't know "Kapampangan" as a language code â€” it has no
     # dedicated phoneme set for it. We pass the closest supported code
     # so the model's text-to-phoneme step doesn't error out; the actual
     # voice timbre/accent still comes from the reference clip itself.
@@ -71,13 +72,13 @@ _tts_model = None
 def _get_tts_model():
     """
     Lazily loads the Coqui XTTS v2 model. This is intentionally NOT loaded
-    at import time — it's a large model (needs a few GB of RAM/VRAM) and
+    at import time â€” it's a large model (needs a few GB of RAM/VRAM) and
     most deployments of this service (e.g. a small Render instance) won't
     want to pay that cost unless /synthesize-speech is actually called.
 
     Requires: pip install TTS
     In production, this model should run on its own worker with a GPU
-    (or at least several CPU cores) — training/inference here is far
+    (or at least several CPU cores) â€” training/inference here is far
     heavier than the Gemini API calls used elsewhere in this file.
     """
     global _tts_model
@@ -131,7 +132,7 @@ def _info_file(store_path: Path) -> Path:
 # ---------------------------------------------------------------------
 
 # Column headers that are clearly not language text (row numbers, IDs,
-# etc.) — excluded from guessing so they're never mistaken for a
+# etc.) â€” excluded from guessing so they're never mistaken for a
 # language column.
 _ID_LIKE_COLUMNS = {"id", "no", "no.", "num", "number", "#", "index", "row", "count", "item"}
 
@@ -159,10 +160,10 @@ def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, st
     Figures out which two columns hold `lang_a` and `lang_b` text.
 
     Returns (a_col, b_col, note). `note` is None when the columns were
-    matched with confidence — either by name, or because there was only
+    matched with confidence â€” either by name, or because there was only
     one possible column left to guess. When there's genuine ambiguity
     (2+ equally-plausible columns and no name match to break the tie),
-    this raises a clear error instead of silently guessing — guessing
+    this raises a clear error instead of silently guessing â€” guessing
     wrong here means silently training on the wrong language's data,
     which is worse than asking the person to type a name that matches
     a column header.
@@ -197,7 +198,7 @@ def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, st
             return a_col, b_col, None
         raise ValueError(
             f"'{lang_b}' didn't match any column header, and there's more than "
-            f"one column it could be ({remaining}) — too ambiguous to guess safely. "
+            f"one column it could be ({remaining}) â€” too ambiguous to guess safely. "
             f"Type '{lang_b}' to exactly match one of these column names, or "
             f"rename the file's columns."
         )
@@ -209,7 +210,7 @@ def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, st
             return a_col, b_col, None
         raise ValueError(
             f"'{lang_a}' didn't match any column header, and there's more than "
-            f"one column it could be ({remaining}) — too ambiguous to guess safely. "
+            f"one column it could be ({remaining}) â€” too ambiguous to guess safely. "
             f"Type '{lang_a}' to exactly match one of these column names "
             f"(e.g. one of {remaining}), or rename the file's columns."
         )
@@ -229,7 +230,7 @@ def _detect_columns(df: pd.DataFrame, lang_a: str, lang_b: str) -> tuple[str, st
     raise ValueError(
         f"Neither '{lang_a}' nor '{lang_b}' matched a column header, and this "
         f"file has {len(candidate_cols)} possible language columns ({candidate_cols}) "
-        f"— too ambiguous to guess safely. Type language names that exactly match "
+        f"â€” too ambiguous to guess safely. Type language names that exactly match "
         f"two of these column names."
     )
 
@@ -262,11 +263,11 @@ def _pairs_from_xlsx(xlsx_path: str, lang_a: str, lang_b: str) -> tuple[list[tup
 
 
 # ---------------------------------------------------------------------
-# Parsing: PDF glossary (best-effort — glossary layouts vary a lot)
+# Parsing: PDF glossary (best-effort â€” glossary layouts vary a lot)
 # ---------------------------------------------------------------------
 
 _GLOSSARY_LINE_RE = re.compile(
-    r"^\s*(?P<source>.+?)\s*(?:[-–—:]|\t|\s{3,})\s*(?P<target>.+?)\s*$"
+    r"^\s*(?P<source>.+?)\s*(?:[-â€“â€”:]|\t|\s{3,})\s*(?P<target>.+?)\s*$"
 )
 
 
@@ -274,20 +275,20 @@ def _pairs_via_gemini_extraction(text: str, lang_a: str, lang_b: str) -> list[tu
     """
     Best-effort extraction of (source, target) translation pairs from
     unstructured text using Gemini itself. This is the fallback for PDFs
-    (or any dataset) that aren't laid out as a clean two-column glossary —
+    (or any dataset) that aren't laid out as a clean two-column glossary â€”
     e.g. translations embedded in prose, tables that didn't extract
-    cleanly, or mixed formatting — so training isn't limited to rigidly
+    cleanly, or mixed formatting â€” so training isn't limited to rigidly
     formatted files.
     """
-    text = text[:60000]  # cap input — this is for glossary-style docs, not whole books
+    text = text[:60000]  # cap input â€” this is for glossary-style docs, not whole books
 
     lang_hint = f" The two languages involved are '{lang_a}' and '{lang_b}'." if lang_a and lang_b else ""
 
     prompt = (
         "Extract every translation pair you can find in the text below and return "
-        "them as a JSON array of [source, target] pairs — respond with ONLY the "
+        "them as a JSON array of [source, target] pairs â€” respond with ONLY the "
         "JSON array, no explanations, no markdown code fences." + lang_hint +
-        " Only include genuine word/phrase/sentence translation pairs — skip "
+        " Only include genuine word/phrase/sentence translation pairs â€” skip "
         "headers, page numbers, and unrelated text.\n\nText:\n" + text
     )
 
@@ -342,7 +343,7 @@ def _pairs_from_pdf(pdf_path: str, lang_a: str = "", lang_b: str = "") -> tuple[
     if pairs:
         return pairs, None
 
-    # No clean "source - target" glossary lines found — the PDF might still
+    # No clean "source - target" glossary lines found â€” the PDF might still
     # have translations in it (a table that didn't extract as neat lines,
     # prose with inline translations, etc.). Fall back to asking Gemini to
     # pull pairs out of the raw extracted text directly.
@@ -360,7 +361,7 @@ def _pairs_from_pdf(pdf_path: str, lang_a: str = "", lang_b: str = "") -> tuple[
         note = (
             "This PDF wasn't a simple 'source - target' line-by-line glossary, so "
             "Gemini was used to extract the translation pairs from the text directly "
-            "— spot-check a few entries after training to make sure they're correct."
+            "â€” spot-check a few entries after training to make sure they're correct."
         )
     return pairs, note
 
@@ -400,7 +401,7 @@ def _pairs_from_txt(txt_path: str, lang_a: str = "", lang_b: str = "") -> tuple[
     if pairs:
         note = (
             "This text file wasn't a simple 'source - target' line-by-line glossary, "
-            "so Gemini was used to extract the translation pairs directly — "
+            "so Gemini was used to extract the translation pairs directly â€” "
             "spot-check a few entries after training."
         )
     return pairs, note
@@ -476,9 +477,9 @@ def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict
             "count": 0,
             "message": (
                 f"No translation pairs could be found in this file for '{lang_a}' / "
-                f"'{lang_b}'. Make sure it actually contains matching translations — "
+                f"'{lang_b}'. Make sure it actually contains matching translations â€” "
                 "either two columns (one per language) with the same rows lined up, "
-                "or, for PDFs, some recognizable source/target text — not just a "
+                "or, for PDFs, some recognizable source/target text â€” not just a "
                 "single-language word list or unrelated data."
             ),
         }
@@ -531,7 +532,7 @@ def language_pair_is_trained(lang_a: str, lang_b: str) -> bool:
 
 
 def list_trained_languages() -> list[str]:
-    """Returns human-readable pair labels, e.g. ['Kapampangan ↔ Tagalog', 'Tagalog ↔ English']."""
+    """Returns human-readable pair labels, e.g. ['Kapampangan â†” Tagalog', 'Tagalog â†” English']."""
     if not VECTORSTORE_DIR.exists():
         return []
     labels = []
@@ -542,9 +543,9 @@ def list_trained_languages() -> list[str]:
         if info_path.exists():
             with open(info_path, "r", encoding="utf-8") as f:
                 info = json.load(f)
-            labels.append(f"{info['lang_a']} ↔ {info['lang_b']}")
+            labels.append(f"{info['lang_a']} â†” {info['lang_b']}")
         else:
-            labels.append(p.name.replace("__", " ↔ "))
+            labels.append(p.name.replace("__", " â†” "))
     return labels
 
 
@@ -612,7 +613,7 @@ def translate_text(
         f"'{target_language}'. Use the example translations below (retrieved from a "
         "verified translation memory) to match terminology, tone, and phrasing. If no "
         "examples are relevant, translate using your own knowledge of both languages. "
-        "Respond with ONLY the translated text — no explanations, no quotes, no extra "
+        "Respond with ONLY the translated text â€” no explanations, no quotes, no extra "
         "commentary.\n\nExamples:\n" + _format_examples(examples)
     )
     user_prompt = f"Translate this text from {source_language} into {target_language}:\n\n{text}"
@@ -641,7 +642,7 @@ def translate_text(
 # ---------------------------------------------------------------------
 # Unlike train_language() (text glossary -> embeddings), this stores short
 # audio clips + their correct transcript per language. There's no audio
-# similarity search here — a capped batch of the most recently added
+# similarity search here â€” a capped batch of the most recently added
 # samples for that language is fed to Gemini as few-shot reference audio
 # on every transcription call, to calibrate it to the speaker's accent,
 # pronunciation, and spelling conventions for that language.
@@ -690,7 +691,7 @@ def train_audio_sample(language: str, file_path: str, mime_type: str, transcript
             "count": 0,
             "message": (
                 f"Audio clip is too large ({size // 1024} KB). Keep clips under "
-                f"{MAX_AUDIO_SAMPLE_BYTES // (1024 * 1024)} MB — a few seconds is enough."
+                f"{MAX_AUDIO_SAMPLE_BYTES // (1024 * 1024)} MB â€” a few seconds is enough."
             ),
         }
 
@@ -763,21 +764,51 @@ def _load_audio_examples(language: str, max_examples: int = MAX_AUDIO_EXAMPLES_P
 
 
 
-def _pick_reference_clip(language: str) -> Optional[Path]:
-    """
-    Picks the best available reference clip for voice cloning: the most
-    recently added sample for this language, since newer samples are
-    likely to have been recorded with the current mic/setup in mind.
+def _prepare_reference_clip(language: str) -> Optional[Path]:
+    """Return the newest usable voice sample, converting browser audio to WAV when possible.
+
+    The browser recorder may upload WebM/Opus while XTTS is happiest with a
+    normal local audio file. We keep the original sample for the training/STT
+    pipeline and create a cached WAV beside it for TTS.
     """
     lang_dir = _audio_lang_dir(language)
     metadata = _load_audio_metadata(lang_dir)
     if not metadata:
         return None
 
-    for m in reversed(metadata):  # most recent first
+    for m in reversed(metadata):
         candidate = lang_dir / m["filename"]
-        if candidate.exists():
+        if not candidate.exists():
+            continue
+
+        if candidate.suffix.lower() == ".wav":
             return candidate
+
+        wav_path = candidate.with_suffix(".tts.wav")
+        if wav_path.exists() and wav_path.stat().st_size > 0:
+            return wav_path
+
+        # Chrome/Edge MediaRecorder commonly produces WebM/Opus.
+        # If ffmpeg is available on the server, convert it to mono 24 kHz WAV.
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-i", str(candidate),
+                    "-ac", "1", "-ar", "24000",
+                    str(wav_path),
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            if wav_path.exists() and wav_path.stat().st_size > 0:
+                return wav_path
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            # Fall back to the original file. XTTS/Torchaudio may still be able
+            # to decode it depending on the deployment's installed codecs.
+            return candidate
+
     return None
 
 
@@ -788,7 +819,7 @@ def synthesize_speech(text: str, language: str) -> dict:
     same samples collected by train_audio_sample() for STT calibration).
 
     This is how languages with no OS/browser TTS voice (e.g. Kapampangan)
-    can still be "spoken" — the voice comes from real recorded samples of
+    can still be "spoken" â€” the voice comes from real recorded samples of
     a speaker of that language, not from a pre-built system voice.
 
     Returns: {"success": bool, "audio": bytes | None, "mime_type": str,
@@ -798,7 +829,7 @@ def synthesize_speech(text: str, language: str) -> dict:
     if not text:
         return {"success": False, "audio": None, "mime_type": "", "message": "No text to speak."}
 
-    reference_clip = _pick_reference_clip(language)
+    reference_clip = _prepare_reference_clip(language)
     if reference_clip is None:
         return {
             "success": False,
@@ -806,12 +837,19 @@ def synthesize_speech(text: str, language: str) -> dict:
             "mime_type": "",
             "message": (
                 f"No voice samples trained for '{language}' yet. Record a few short, clear "
-                "clips via the pronunciation trainer first — even 3-5 short samples from one "
+                "clips via the pronunciation trainer first â€” even 3-5 short samples from one "
                 "speaker are enough to clone a voice from."
             ),
         }
 
-    xtts_lang = XTTS_LANGUAGE_FALLBACK.get(language.strip().lower(), "en")
+    language_key = language.strip().lower()
+    xtts_lang = XTTS_LANGUAGE_FALLBACK.get(language_key, "en")
+
+    # XTTS-v2 has no native Kapampangan phoneme/language code. The current
+    # project therefore uses Tagalog (tl) only as the closest text-processing
+    # fallback. The speaker identity still comes from the user's recording.
+    # This is intentionally explicit so a future Kapampangan-capable TTS model
+    # can replace the fallback without changing the API or translate.php.
 
     try:
         model = _get_tts_model()
@@ -866,8 +904,8 @@ def _transcribe_audio(
 
     If `reference_examples` is provided (each a dict with "data",
     "mime_type", "transcript"), they're fed to Gemini first as few-shot
-    reference recordings — trained pronunciation samples for this
-    language — to calibrate its understanding of accent, pronunciation,
+    reference recordings â€” trained pronunciation samples for this
+    language â€” to calibrate its understanding of accent, pronunciation,
     and spelling before it transcribes the real clip.
     """
     with open(file_path, "rb") as f:
@@ -882,7 +920,7 @@ def _transcribe_audio(
         contents.append(
             "Here are reference recordings from a trained speaker in this language, each "
             "followed by its correct transcript. Use these ONLY to calibrate your "
-            "understanding of pronunciation and spelling conventions — do NOT transcribe "
+            "understanding of pronunciation and spelling conventions â€” do NOT transcribe "
             "these reference clips themselves."
         )
         for example in reference_examples:
@@ -891,7 +929,7 @@ def _transcribe_audio(
 
     contents.append(
         f"Now transcribe ONLY the following new audio clip. Respond with ONLY the "
-        f"verbatim transcript in '{spoken_language}' — no explanations, no quotes, no "
+        f"verbatim transcript in '{spoken_language}' â€” no explanations, no quotes, no "
         "extra commentary. If the audio is silent or unintelligible, respond with an "
         "empty string."
     )
