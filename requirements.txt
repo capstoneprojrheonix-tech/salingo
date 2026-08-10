@@ -7,3 +7,4 @@ pandas
 openpyxl
 numpy
 python-dotenv
+TTS
