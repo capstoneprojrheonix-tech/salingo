@@ -196,3 +196,53 @@ def delete_language_pair(language: str, target_language: str = "English"):
     if not deleted:
         raise HTTPException(404, "Language pair not found / not trained yet")
     return {"success": True, "message": f"Deleted training data for '{language}' <-> '{target_language}'"}
+
+
+# ---------------------------------------------------------------------
+# languageManagement (admin dashboard rows, Supabase-backed)
+# ---------------------------------------------------------------------
+# Used by languageManagement.php on InfinityFree, which can't reach
+# Supabase directly (outbound DB ports are blocked on InfinityFree).
+# These routes are plain CRUD over the "languageManagement" table —
+# they don't touch the RAG translation memory (that's /train and the
+# /languages routes above).
+
+class LanguageRecordUpdate(BaseModel):
+    language_name: str
+    status: str
+    file_name: Optional[str] = None
+    translation: Optional[int] = None
+
+
+@app.post("/language-records")
+def create_language_record(
+    language_name: str = Form(...),
+    translation: int = Form(0),
+    file_name: str = Form(""),
+    status: str = Form("Active"),
+):
+    new_id = agent.db_insert_language_record(language_name, translation, file_name, status)
+    return {"success": True, "id": new_id}
+
+
+@app.get("/language-records")
+def list_language_records():
+    return {"records": agent.db_list_language_records()}
+
+
+@app.get("/language-records/{record_id}")
+def get_language_record(record_id: int):
+    record = agent.db_get_language_record(record_id)
+    if record is None:
+        raise HTTPException(404, "Language record not found")
+    return record
+
+
+@app.put("/language-records/{record_id}")
+def update_language_record(record_id: int, body: LanguageRecordUpdate):
+    updated = agent.db_update_language_record(
+        record_id, body.language_name, body.status, body.file_name, body.translation
+    )
+    if not updated:
+        raise HTTPException(404, "Language record not found")
+    return {"success": True}
