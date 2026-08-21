@@ -174,20 +174,20 @@ EMBEDDING_BATCH_SIZE = 100
 MAX_AUDIO_EXAMPLES_PER_REQUEST = 5  # how many reference clips to feed Gemini per transcription
 MAX_AUDIO_SAMPLE_BYTES = 5 * 1024 * 1024  # 5 MB cap per training clip
 
-# TTS (voice cloning) — reuses the same pronunciation samples collected by
-# train_audio_sample() into Supabase's "recordingManagement" table, but as
-# reference audio for ElevenLabs voice cloning instead of as few-shot
-# calibration for transcription.
+# TTS (premade voice) — speaks translated text using one of ElevenLabs'
+# stock/premade voices (e.g. "Josh"), NOT a cloned voice. This works on
+# the ElevenLabs FREE plan, unlike Instant Voice Cloning which requires a
+# paid plan.
 #
 # Why ElevenLabs instead of a self-hosted model (XTTS/Chatterbox/etc): those
 # all need several GB of RAM to load, which reliably OOM-crashes small hosts
 # (Render free/starter tier). ElevenLabs runs the model on their servers —
 # this backend just makes a couple of small HTTPS calls.
 #
-# NOTE: ElevenLabs has no official Kapampangan language support (same
-# limitation XTTS had) — the cloned voice's timbre/accent comes from the
-# reference recordings, but pronunciation accuracy for Kapampangan text is
-# best-effort from their multilingual model, not guaranteed.
+# NOTE: ElevenLabs has no official Kapampangan language support — the
+# premade voice's timbre/accent is whatever that stock voice sounds like,
+# and pronunciation accuracy for Kapampangan text is best-effort from
+# their multilingual model, not guaranteed.
 #
 # NOTE: audio generated on an ElevenLabs FREE plan key cannot be used
 # commercially (no monetization, requires attribution). For a live/public
@@ -196,7 +196,12 @@ MAX_AUDIO_SAMPLE_BYTES = 5 * 1024 * 1024  # 5 MB cap per training clip
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1"
 ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
-MAX_VOICE_CLONE_SAMPLES = 5  # how many stored clips to submit when (re)building a cloned voice
+# Name of the premade ElevenLabs voice to speak with, e.g. "Josh", "Rachel",
+# "Bella". Must match a voice name visible under the account's Voice Library
+# (My Voices / Default voices) exactly (case-insensitive match is used below).
+ELEVENLABS_VOICE_NAME = os.getenv("ELEVENLABS_VOICE_NAME", "Josh")
+
+_premade_voice_cache: dict[str, str] = {}  # voice_name (lowercased) -> voice_id, in-memory only
 
 _client = None
 
@@ -813,14 +818,6 @@ def train_audio_sample(language: str, file_path: str, mime_type: str, transcript
     except Exception as e:
         return {"success": False, "count": 0, "message": f"Database error while saving sample: {e}"}
 
-    # A new sample was added — drop any cached ElevenLabs voice for this
-    # language so the next "Speak result" rebuilds it with the new sample
-    # included, instead of quietly reusing the old cloned voice.
-    try:
-        invalidate_voice_cache(language)
-    except Exception:
-        pass  # don't fail the save just because cache invalidation hiccuped
-
     return {
         "success": True,
         "count": count,
@@ -859,12 +856,6 @@ def delete_audio_sample(language: str, sample_id: str) -> bool:
     finally:
         conn.close()
 
-    if deleted:
-        try:
-            invalidate_voice_cache(language)
-        except Exception:
-            pass
-
     return deleted
 
 
@@ -887,139 +878,63 @@ def _load_audio_examples(language: str, max_examples: int = MAX_AUDIO_EXAMPLES_P
     ]
 
 
-def _get_cached_voice_id(language_key: str) -> Optional[tuple]:
-    """Returns (voice_id, sample_count) if a cloned voice is already cached
-    for this language, else None."""
-    conn = _get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                'SELECT "VoiceId", "SampleCount" FROM "ttsVoiceManagement" WHERE "Language" = %s',
-                (language_key,),
-            )
-            row = cur.fetchone()
-    finally:
-        conn.close()
-    return (row[0], row[1]) if row else None
-
-
-def _cache_voice_id(language_key: str, voice_id: str, sample_count: int):
-    conn = _get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO "ttsVoiceManagement" ("Language", "VoiceId", "SampleCount")
-                VALUES (%s, %s, %s)
-                ON CONFLICT ("Language")
-                DO UPDATE SET "VoiceId" = EXCLUDED."VoiceId", "SampleCount" = EXCLUDED."SampleCount"
-                """,
-                (language_key, voice_id, sample_count),
-            )
-            conn.commit()
-    finally:
-        conn.close()
-
-
-def invalidate_voice_cache(language: str):
+def _get_premade_voice_id(voice_name: str = ELEVENLABS_VOICE_NAME) -> dict:
     """
-    Drops the cached ElevenLabs voice_id for `language`, so the NEXT
-    synthesize_speech() call rebuilds the cloned voice from the current
-    (updated) set of training samples instead of reusing a stale voice.
-    Called after a sample is added or deleted.
-    """
-    language_key = _slug(language)
-    conn = _get_db_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute('DELETE FROM "ttsVoiceManagement" WHERE "Language" = %s', (language_key,))
-            conn.commit()
-    finally:
-        conn.close()
+    Returns {"voice_id": str} for an existing ElevenLabs premade/stock voice
+    matched by name (e.g. "Josh") — no cloning, works on the Free plan.
+    Result is cached in-memory per process so we don't call GET /v1/voices
+    on every single "Speak result" click.
 
-
-def _get_or_create_elevenlabs_voice(language: str) -> dict:
-    """
-    Returns {"voice_id": str} for a cloned ElevenLabs voice built from this
-    language's stored pronunciation samples — reusing a cached voice_id if
-    one already exists and the sample set hasn't changed, otherwise
-    (re)creating it from up to MAX_VOICE_CLONE_SAMPLES stored clips.
-
-    Returns {"error": message} on failure (no samples trained, API error, etc).
+    Returns {"error": message} on failure (bad key, name not found, etc).
     """
     if not ELEVENLABS_API_KEY:
         return {"error": "ELEVENLABS_API_KEY is not set on the server."}
 
-    language_key = _slug(language)
-    examples = _load_audio_examples(language, max_examples=MAX_VOICE_CLONE_SAMPLES)
-
-    if not examples:
-        return {
-            "error": (
-                f"No voice samples trained for '{language}' yet. Record a few short, clear "
-                "clips via the pronunciation trainer first — even one clean sample is enough "
-                "to clone a voice from."
-            )
-        }
-
-    cached = _get_cached_voice_id(language_key)
-    if cached and cached[1] == len(examples):
-        # Same sample count as last time this voice was built — reuse it.
-        return {"voice_id": cached[0]}
-
-    # Sample set changed (or no cache yet) — (re)build the cloned voice.
-    # If we're replacing an old voice, delete it from ElevenLabs first so
-    # we don't silently accumulate orphaned voices against the account's
-    # voice-slot limit (free tier: 3 instant clone slots).
-    if cached:
-        try:
-            requests.delete(
-                f"{ELEVENLABS_API_BASE}/voices/{cached[0]}",
-                headers={"xi-api-key": ELEVENLABS_API_KEY},
-                timeout=15,
-            )
-        except requests.RequestException:
-            pass  # best-effort cleanup; not fatal if it fails
-
-    files = [
-        ("files", (f"sample_{i}.{ex['mime_type'].split('/')[-1] or 'webm'}", ex["data"], ex["mime_type"]))
-        for i, ex in enumerate(examples)
-    ]
+    cache_key = voice_name.strip().lower()
+    if cache_key in _premade_voice_cache:
+        return {"voice_id": _premade_voice_cache[cache_key]}
 
     try:
-        resp = requests.post(
-            f"{ELEVENLABS_API_BASE}/voices/add",
+        resp = requests.get(
+            f"{ELEVENLABS_API_BASE}/voices",
             headers={"xi-api-key": ELEVENLABS_API_KEY},
-            data={
-                "name": f"SALINGO {language}",
-                "description": f"Auto-cloned SALINGO pronunciation voice for {language}",
-            },
-            files=files,
-            timeout=60,
+            timeout=30,
         )
     except requests.RequestException as e:
         return {"error": f"Could not reach ElevenLabs: {e}"}
 
     if resp.status_code >= 400:
         detail = resp.text[:300]
-        return {"error": f"ElevenLabs voice creation failed ({resp.status_code}): {detail}"}
+        return {"error": f"Could not list ElevenLabs voices ({resp.status_code}): {detail}"}
 
-    voice_id = resp.json().get("voice_id")
+    voices = resp.json().get("voices", [])
+    match = next((v for v in voices if (v.get("name") or "").strip().lower() == cache_key), None)
+
+    if not match:
+        available = ", ".join(v.get("name", "?") for v in voices) or "(none returned)"
+        return {
+            "error": (
+                f"No ElevenLabs voice named '{voice_name}' found on this account. "
+                f"Available voices: {available}"
+            )
+        }
+
+    voice_id = match.get("voice_id")
     if not voice_id:
-        return {"error": "ElevenLabs did not return a voice_id."}
+        return {"error": "Matched voice has no voice_id."}
 
-    _cache_voice_id(language_key, voice_id, len(examples))
+    _premade_voice_cache[cache_key] = voice_id
     return {"voice_id": voice_id}
 
 
 def synthesize_speech(text: str, language: str) -> dict:
     """
-    Synthesize `text` spoken in `language`, using an ElevenLabs voice cloned
-    from the trained pronunciation samples in Supabase's "recordingManagement"
-    table. This is how languages with no OS/browser TTS voice (e.g.
-    Kapampangan) can still be "spoken" on the frontend — the voice comes
-    from real recorded samples of a speaker of that language, not from a
-    pre-built system voice.
+    Synthesize `text` using a premade ElevenLabs voice (ELEVENLABS_VOICE_NAME,
+    e.g. "Josh") — NOT a cloned voice. This is how languages with no OS/
+    browser TTS voice (e.g. Kapampangan) can still be "spoken" on the
+    frontend. `language` is accepted for interface compatibility with the
+    old cloned-voice version and for future per-language voice mapping, but
+    currently every language is spoken with the same premade voice.
 
     Returns: {"success": bool, "audio": bytes | None, "mime_type": str,
               "message": str}
@@ -1028,7 +943,7 @@ def synthesize_speech(text: str, language: str) -> dict:
     if not text:
         return {"success": False, "audio": None, "mime_type": "", "message": "No text to speak."}
 
-    voice_result = _get_or_create_elevenlabs_voice(language)
+    voice_result = _get_premade_voice_id()
     if "error" in voice_result:
         return {"success": False, "audio": None, "mime_type": "", "message": voice_result["error"]}
 
