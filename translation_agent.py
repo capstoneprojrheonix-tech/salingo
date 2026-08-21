@@ -24,13 +24,13 @@ import re
 import json
 import shutil
 import tempfile
-import uuid
 import subprocess
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+import psycopg2
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -41,8 +41,132 @@ load_dotenv()
 BASE_DIR = Path(__file__).parent
 VECTORSTORE_DIR = BASE_DIR / "vectorstores"
 VECTORSTORE_DIR.mkdir(exist_ok=True)
-AUDIO_TRAIN_DIR = BASE_DIR / "audio_training"
-AUDIO_TRAIN_DIR.mkdir(exist_ok=True)
+
+# Pronunciation/voice recordings (used to be a local audio_training/<lang>/
+# folder — moved to Supabase Postgres's "recordingManagement" table so
+# recordings survive redeploys/restarts/spin-downs on hosts with an
+# ephemeral filesystem (e.g. Render's free tier).
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+
+
+def _get_db_connection():
+    """
+    Opens a fresh connection to the Supabase Postgres database.
+    Requires SUPABASE_DB_URL in the environment, e.g.:
+        postgresql://postgres:<password>@<host>:5432/postgres
+    Find this under Supabase dashboard -> Project Settings -> Database
+    -> Connection string -> URI.
+    """
+    if not SUPABASE_DB_URL:
+        raise RuntimeError(
+            "SUPABASE_DB_URL is not set. Add it to your .env (local) or "
+            "your host's environment variables (Render/Hostinger/etc)."
+        )
+    return psycopg2.connect(SUPABASE_DB_URL)
+
+
+# ---------------------------------------------------------------------
+# languageManagement table (admin dashboard rows) — Supabase-backed
+# ---------------------------------------------------------------------
+# This is separate from the RAG translation memory in vectorstores/.
+# It's the bookkeeping table languageManagement.php's dashboard reads
+# and writes: one row per "language added" action, tracking its display
+# name, a running translation-pair count, the uploaded filename, and an
+# Active/Inactive status. PHP on InfinityFree can't reach Supabase
+# directly (outbound DB ports are blocked there), so PHP calls these
+# through HTTP endpoints on this Python service instead — see main.py's
+# /language-records routes and ai_bridge.php's matching PHP functions.
+
+def db_insert_language_record(language_name: str, translation: int, file_name: str, status: str = "Active") -> int:
+    """Insert a new languageManagement row. Returns the new row's ID."""
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO "languageManagement" ("LanguageName", "Translation", "FileName", "Status")
+                VALUES (%s, %s, %s, %s)
+                RETURNING "ID"
+                """,
+                (language_name, translation, file_name, status),
+            )
+            new_id = cur.fetchone()[0]
+            conn.commit()
+    finally:
+        conn.close()
+    return new_id
+
+
+def db_get_language_record(record_id: int) -> Optional[dict]:
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT "ID", "LanguageName", "Translation", "FileName", "Status" '
+                'FROM "languageManagement" WHERE "ID" = %s',
+                (record_id,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {"id": row[0], "language_name": row[1], "translation": row[2], "file_name": row[3], "status": row[4]}
+
+
+def db_update_language_record(
+    record_id: int,
+    language_name: str,
+    status: str,
+    file_name: Optional[str] = None,
+    translation: Optional[int] = None,
+) -> bool:
+    """Update a languageManagement row. If file_name/translation are None,
+    those columns are left unchanged (matches the old PHP behavior where
+    editing without picking a new file kept the existing FileName/Translation)."""
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            if file_name is not None:
+                cur.execute(
+                    """
+                    UPDATE "languageManagement"
+                    SET "LanguageName" = %s, "FileName" = %s, "Translation" = %s, "Status" = %s
+                    WHERE "ID" = %s
+                    """,
+                    (language_name, file_name, translation, status, record_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE "languageManagement"
+                    SET "LanguageName" = %s, "Status" = %s
+                    WHERE "ID" = %s
+                    """,
+                    (language_name, status, record_id),
+                )
+            updated = cur.rowcount > 0
+            conn.commit()
+    finally:
+        conn.close()
+    return updated
+
+
+def db_list_language_records() -> list[dict]:
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT "ID", "LanguageName", "Translation", "FileName", "Status" '
+                'FROM "languageManagement" ORDER BY "ID" ASC'
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [
+        {"id": r[0], "language_name": r[1], "translation": r[2], "file_name": r[3], "status": r[4]}
+        for r in rows
+    ]
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 CHAT_MODEL = "gemini-3.5-flash"
@@ -641,38 +765,19 @@ def translate_text(
 # Voice pronunciation training (audio reference samples)
 # ---------------------------------------------------------------------
 # Unlike train_language() (text glossary -> embeddings), this stores short
-# audio clips + their correct transcript per language. There's no audio
-# similarity search here â€” a capped batch of the most recently added
-# samples for that language is fed to Gemini as few-shot reference audio
-# on every transcription call, to calibrate it to the speaker's accent,
-# pronunciation, and spelling conventions for that language.
-
-def _audio_lang_dir(language: str) -> Path:
-    return AUDIO_TRAIN_DIR / _slug(language)
-
-
-def _audio_metadata_file(lang_dir: Path) -> Path:
-    return lang_dir / "metadata.json"
-
-
-def _load_audio_metadata(lang_dir: Path) -> list[dict]:
-    meta_file = _audio_metadata_file(lang_dir)
-    if not meta_file.exists():
-        return []
-    with open(meta_file, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _save_audio_metadata(lang_dir: Path, metadata: list[dict]):
-    lang_dir.mkdir(parents=True, exist_ok=True)
-    with open(_audio_metadata_file(lang_dir), "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False)
-
+# audio clips + their correct transcript per language, in the Supabase
+# "recordingManagement" table (see salingo_supabase_migration.sql).
+# There's no audio similarity search here â€” a capped batch of the most
+# recently added samples for that language is fed to Gemini as few-shot
+# reference audio on every transcription call, to calibrate it to the
+# speaker's accent, pronunciation, and spelling conventions for that
+# language. The same samples double as the reference voice for TTS
+# (see synthesize_speech / _prepare_reference_clip below).
 
 def train_audio_sample(language: str, file_path: str, mime_type: str, transcript: str) -> dict:
     """
     Save a short audio clip + its correct transcript as a pronunciation
-    reference sample for `language`.
+    reference sample for `language`, into Supabase.
 
     Returns: {"success": bool, "count": int, "message": str}
     """
@@ -695,121 +800,149 @@ def train_audio_sample(language: str, file_path: str, mime_type: str, transcript
             ),
         }
 
-    lang_dir = _audio_lang_dir(language)
-    lang_dir.mkdir(parents=True, exist_ok=True)
-    metadata = _load_audio_metadata(lang_dir)
+    language_key = _slug(language)
+    with open(src, "rb") as f:
+        audio_bytes = f.read()
 
-    sample_id = uuid.uuid4().hex[:12]
-    ext = src.suffix or ".webm"
-    dest_filename = f"{sample_id}{ext}"
-    shutil.copyfile(src, lang_dir / dest_filename)
-
-    metadata.append(
-        {
-            "id": sample_id,
-            "filename": dest_filename,
-            "mime_type": mime_type,
-            "transcript": transcript,
-            "language": language,
-        }
-    )
-    _save_audio_metadata(lang_dir, metadata)
+    try:
+        conn = _get_db_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO "recordingManagement" ("Language", "Transcript", "AudioData", "MimeType")
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (language_key, transcript, psycopg2.Binary(audio_bytes), mime_type),
+                )
+                conn.commit()
+                cur.execute(
+                    'SELECT COUNT(*) FROM "recordingManagement" WHERE "Language" = %s',
+                    (language_key,),
+                )
+                count = cur.fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as e:
+        return {"success": False, "count": 0, "message": f"Database error while saving sample: {e}"}
 
     return {
         "success": True,
-        "count": len(metadata),
-        "message": f"Saved pronunciation sample for '{language}' ({len(metadata)} total).",
+        "count": count,
+        "message": f"Saved pronunciation sample for '{language}' ({count} total).",
     }
 
 
 def list_audio_samples(language: str) -> list[dict]:
     """Returns [{"id": ..., "transcript": ...}, ...] for a given language."""
-    lang_dir = _audio_lang_dir(language)
-    metadata = _load_audio_metadata(lang_dir)
-    return [{"id": m["id"], "transcript": m["transcript"]} for m in metadata]
+    language_key = _slug(language)
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT "ID", "Transcript" FROM "recordingManagement" '
+                'WHERE "Language" = %s ORDER BY "CreatedAt" ASC',
+                (language_key,),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [{"id": str(row[0]), "transcript": row[1]} for row in rows]
 
 
 def delete_audio_sample(language: str, sample_id: str) -> bool:
-    lang_dir = _audio_lang_dir(language)
-    metadata = _load_audio_metadata(lang_dir)
-    match = next((m for m in metadata if m["id"] == sample_id), None)
-    if not match:
-        return False
-
-    file_path = lang_dir / match["filename"]
-    if file_path.exists():
-        file_path.unlink()
-
-    metadata = [m for m in metadata if m["id"] != sample_id]
-    _save_audio_metadata(lang_dir, metadata)
-    return True
+    language_key = _slug(language)
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'DELETE FROM "recordingManagement" WHERE "ID" = %s AND "Language" = %s',
+                (sample_id, language_key),
+            )
+            deleted = cur.rowcount > 0
+            conn.commit()
+    finally:
+        conn.close()
+    return deleted
 
 
 def _load_audio_examples(language: str, max_examples: int = MAX_AUDIO_EXAMPLES_PER_REQUEST) -> list[dict]:
-    lang_dir = _audio_lang_dir(language)
-    metadata = _load_audio_metadata(lang_dir)
-    if not metadata:
-        return []
-
-    chosen = metadata[-max_examples:]  # most recently added samples
-    examples = []
-    for m in chosen:
-        file_path = lang_dir / m["filename"]
-        if not file_path.exists():
-            continue
-        with open(file_path, "rb") as f:
-            data = f.read()
-        examples.append({"data": data, "mime_type": m["mime_type"], "transcript": m["transcript"]})
-    return examples
-
+    language_key = _slug(language)
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT "AudioData", "MimeType", "Transcript" FROM "recordingManagement" '
+                'WHERE "Language" = %s ORDER BY "CreatedAt" DESC LIMIT %s',
+                (language_key, max_examples),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [
+        {"data": bytes(row[0]), "mime_type": row[1], "transcript": row[2]}
+        for row in rows
+    ]
 
 
 def _prepare_reference_clip(language: str) -> Optional[Path]:
-    """Return the newest usable voice sample, converting browser audio to WAV when possible.
+    """Fetch the newest usable voice sample from Supabase and write it to a
+    temp file, converting browser audio to WAV when possible.
 
     The browser recorder may upload WebM/Opus while XTTS is happiest with a
-    normal local audio file. We keep the original sample for the training/STT
-    pipeline and create a cached WAV beside it for TTS.
+    normal local audio file. If ffmpeg is available, we convert; otherwise we
+    hand XTTS the raw bytes as-is.
     """
-    lang_dir = _audio_lang_dir(language)
-    metadata = _load_audio_metadata(lang_dir)
-    if not metadata:
+    language_key = _slug(language)
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT "AudioData", "MimeType" FROM "recordingManagement" '
+                'WHERE "Language" = %s ORDER BY "CreatedAt" DESC LIMIT 1',
+                (language_key,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    if row is None:
         return None
 
-    for m in reversed(metadata):
-        candidate = lang_dir / m["filename"]
-        if not candidate.exists():
-            continue
+    audio_bytes, mime_type = bytes(row[0]), row[1]
 
-        if candidate.suffix.lower() == ".wav":
-            return candidate
+    tmp_dir = Path(tempfile.mkdtemp())
+    ext = ".wav" if "wav" in (mime_type or "") else ".webm"
+    src_path = tmp_dir / f"reference{ext}"
+    with open(src_path, "wb") as f:
+        f.write(audio_bytes)
 
-        wav_path = candidate.with_suffix(".tts.wav")
+    if ext == ".wav":
+        return src_path
+
+    # Chrome/Edge MediaRecorder commonly produces WebM/Opus.
+    # If ffmpeg is available on the server, convert it to mono 24 kHz WAV.
+    wav_path = tmp_dir / "reference.tts.wav"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(src_path),
+                "-ac", "1", "-ar", "24000",
+                str(wav_path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         if wav_path.exists() and wav_path.stat().st_size > 0:
             return wav_path
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        pass
 
-        # Chrome/Edge MediaRecorder commonly produces WebM/Opus.
-        # If ffmpeg is available on the server, convert it to mono 24 kHz WAV.
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-i", str(candidate),
-                    "-ac", "1", "-ar", "24000",
-                    str(wav_path),
-                ],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            if wav_path.exists() and wav_path.stat().st_size > 0:
-                return wav_path
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            # Fall back to the original file. XTTS/Torchaudio may still be able
-            # to decode it depending on the deployment's installed codecs.
-            return candidate
-
-    return None
+    # Fall back to the original file. XTTS/Torchaudio may still be able
+    # to decode it depending on the deployment's installed codecs.
+    return src_path
 
 
 def synthesize_speech(text: str, language: str) -> dict:
@@ -881,6 +1014,9 @@ def synthesize_speech(text: str, language: str) -> dict:
         }
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        # reference_clip lives in its own temp dir (downloaded fresh from
+        # Supabase in _prepare_reference_clip) — clean that up too.
+        shutil.rmtree(reference_clip.parent, ignore_errors=True)
 
     return {
         "success": True,
