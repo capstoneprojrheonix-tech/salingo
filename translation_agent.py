@@ -908,7 +908,18 @@ def _get_premade_voice_id(voice_name: str = ELEVENLABS_VOICE_NAME) -> dict:
         return {"error": f"Could not list ElevenLabs voices ({resp.status_code}): {detail}"}
 
     voices = resp.json().get("voices", [])
+    # ElevenLabs premade voice names often have a descriptor suffix, e.g.
+    # "Josh - Natural Narrator" rather than plain "Josh". Match exactly
+    # first; if that fails, fall back to matching the leading word(s)
+    # before " - ", then a plain substring match.
     match = next((v for v in voices if (v.get("name") or "").strip().lower() == cache_key), None)
+    if not match:
+        match = next(
+            (v for v in voices if (v.get("name") or "").split(" - ")[0].strip().lower() == cache_key),
+            None,
+        )
+    if not match:
+        match = next((v for v in voices if cache_key in (v.get("name") or "").strip().lower()), None)
 
     if not match:
         available = ", ".join(v.get("name", "?") for v in voices) or "(none returned)"
