@@ -24,13 +24,13 @@ import re
 import json
 import shutil
 import tempfile
-import subprocess
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import psycopg2
+import requests
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -174,42 +174,29 @@ EMBEDDING_BATCH_SIZE = 100
 MAX_AUDIO_EXAMPLES_PER_REQUEST = 5  # how many reference clips to feed Gemini per transcription
 MAX_AUDIO_SAMPLE_BYTES = 5 * 1024 * 1024  # 5 MB cap per training clip
 
-# TTS (voice cloning) â€” reuses the same audio_training/<language>/ samples
-# collected by train_audio_sample(), but as reference voice for synthesis
-# instead of as few-shot calibration for transcription.
-MIN_TTS_REFERENCE_SECONDS = 3  # a clip shorter than this is too short to clone a voice from
-XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
-XTTS_LANGUAGE_FALLBACK = {
-    # XTTS doesn't know "Kapampangan" as a language code â€” it has no
-    # dedicated phoneme set for it. We pass the closest supported code
-    # so the model's text-to-phoneme step doesn't error out; the actual
-    # voice timbre/accent still comes from the reference clip itself.
-    "kapampangan": "tl",
-    "tagalog": "tl",
-    "filipino": "tl",
-    "english": "en",
-}
-
-_tts_model = None
-
-
-def _get_tts_model():
-    """
-    Lazily loads the Coqui XTTS v2 model. This is intentionally NOT loaded
-    at import time â€” it's a large model (needs a few GB of RAM/VRAM) and
-    most deployments of this service (e.g. a small Render instance) won't
-    want to pay that cost unless /synthesize-speech is actually called.
-
-    Requires: pip install TTS
-    In production, this model should run on its own worker with a GPU
-    (or at least several CPU cores) â€” training/inference here is far
-    heavier than the Gemini API calls used elsewhere in this file.
-    """
-    global _tts_model
-    if _tts_model is None:
-        from TTS.api import TTS  # local import: optional heavy dependency
-        _tts_model = TTS(XTTS_MODEL_NAME)
-    return _tts_model
+# TTS (voice cloning) — reuses the same pronunciation samples collected by
+# train_audio_sample() into Supabase's "recordingManagement" table, but as
+# reference audio for ElevenLabs voice cloning instead of as few-shot
+# calibration for transcription.
+#
+# Why ElevenLabs instead of a self-hosted model (XTTS/Chatterbox/etc): those
+# all need several GB of RAM to load, which reliably OOM-crashes small hosts
+# (Render free/starter tier). ElevenLabs runs the model on their servers —
+# this backend just makes a couple of small HTTPS calls.
+#
+# NOTE: ElevenLabs has no official Kapampangan language support (same
+# limitation XTTS had) — the cloned voice's timbre/accent comes from the
+# reference recordings, but pronunciation accuracy for Kapampangan text is
+# best-effort from their multilingual model, not guaranteed.
+#
+# NOTE: audio generated on an ElevenLabs FREE plan key cannot be used
+# commercially (no monetization, requires attribution). For a live/public
+# deployment, use a Starter plan ($6/mo+) key instead — nothing in this
+# code needs to change, only the API key.
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1"
+ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
+MAX_VOICE_CLONE_SAMPLES = 5  # how many stored clips to submit when (re)building a cloned voice
 
 _client = None
 
@@ -826,6 +813,14 @@ def train_audio_sample(language: str, file_path: str, mime_type: str, transcript
     except Exception as e:
         return {"success": False, "count": 0, "message": f"Database error while saving sample: {e}"}
 
+    # A new sample was added — drop any cached ElevenLabs voice for this
+    # language so the next "Speak result" rebuilds it with the new sample
+    # included, instead of quietly reusing the old cloned voice.
+    try:
+        invalidate_voice_cache(language)
+    except Exception:
+        pass  # don't fail the save just because cache invalidation hiccuped
+
     return {
         "success": True,
         "count": count,
@@ -863,6 +858,13 @@ def delete_audio_sample(language: str, sample_id: str) -> bool:
             conn.commit()
     finally:
         conn.close()
+
+    if deleted:
+        try:
+            invalidate_voice_cache(language)
+        except Exception:
+            pass
+
     return deleted
 
 
@@ -885,75 +887,139 @@ def _load_audio_examples(language: str, max_examples: int = MAX_AUDIO_EXAMPLES_P
     ]
 
 
-def _prepare_reference_clip(language: str) -> Optional[Path]:
-    """Fetch the newest usable voice sample from Supabase and write it to a
-    temp file, converting browser audio to WAV when possible.
-
-    The browser recorder may upload WebM/Opus while XTTS is happiest with a
-    normal local audio file. If ffmpeg is available, we convert; otherwise we
-    hand XTTS the raw bytes as-is.
-    """
-    language_key = _slug(language)
+def _get_cached_voice_id(language_key: str) -> Optional[tuple]:
+    """Returns (voice_id, sample_count) if a cloned voice is already cached
+    for this language, else None."""
     conn = _get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                'SELECT "AudioData", "MimeType" FROM "recordingManagement" '
-                'WHERE "Language" = %s ORDER BY "CreatedAt" DESC LIMIT 1',
+                'SELECT "VoiceId", "SampleCount" FROM "ttsVoiceManagement" WHERE "Language" = %s',
                 (language_key,),
             )
             row = cur.fetchone()
     finally:
         conn.close()
+    return (row[0], row[1]) if row else None
 
-    if row is None:
-        return None
 
-    audio_bytes, mime_type = bytes(row[0]), row[1]
-
-    tmp_dir = Path(tempfile.mkdtemp())
-    ext = ".wav" if "wav" in (mime_type or "") else ".webm"
-    src_path = tmp_dir / f"reference{ext}"
-    with open(src_path, "wb") as f:
-        f.write(audio_bytes)
-
-    if ext == ".wav":
-        return src_path
-
-    # Chrome/Edge MediaRecorder commonly produces WebM/Opus.
-    # If ffmpeg is available on the server, convert it to mono 24 kHz WAV.
-    wav_path = tmp_dir / "reference.tts.wav"
+def _cache_voice_id(language_key: str, voice_id: str, sample_count: int):
+    conn = _get_db_connection()
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", str(src_path),
-                "-ac", "1", "-ar", "24000",
-                str(wav_path),
-            ],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if wav_path.exists() and wav_path.stat().st_size > 0:
-            return wav_path
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        pass
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO "ttsVoiceManagement" ("Language", "VoiceId", "SampleCount")
+                VALUES (%s, %s, %s)
+                ON CONFLICT ("Language")
+                DO UPDATE SET "VoiceId" = EXCLUDED."VoiceId", "SampleCount" = EXCLUDED."SampleCount"
+                """,
+                (language_key, voice_id, sample_count),
+            )
+            conn.commit()
+    finally:
+        conn.close()
 
-    # Fall back to the original file. XTTS/Torchaudio may still be able
-    # to decode it depending on the deployment's installed codecs.
-    return src_path
+
+def invalidate_voice_cache(language: str):
+    """
+    Drops the cached ElevenLabs voice_id for `language`, so the NEXT
+    synthesize_speech() call rebuilds the cloned voice from the current
+    (updated) set of training samples instead of reusing a stale voice.
+    Called after a sample is added or deleted.
+    """
+    language_key = _slug(language)
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM "ttsVoiceManagement" WHERE "Language" = %s', (language_key,))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_or_create_elevenlabs_voice(language: str) -> dict:
+    """
+    Returns {"voice_id": str} for a cloned ElevenLabs voice built from this
+    language's stored pronunciation samples — reusing a cached voice_id if
+    one already exists and the sample set hasn't changed, otherwise
+    (re)creating it from up to MAX_VOICE_CLONE_SAMPLES stored clips.
+
+    Returns {"error": message} on failure (no samples trained, API error, etc).
+    """
+    if not ELEVENLABS_API_KEY:
+        return {"error": "ELEVENLABS_API_KEY is not set on the server."}
+
+    language_key = _slug(language)
+    examples = _load_audio_examples(language, max_examples=MAX_VOICE_CLONE_SAMPLES)
+
+    if not examples:
+        return {
+            "error": (
+                f"No voice samples trained for '{language}' yet. Record a few short, clear "
+                "clips via the pronunciation trainer first — even one clean sample is enough "
+                "to clone a voice from."
+            )
+        }
+
+    cached = _get_cached_voice_id(language_key)
+    if cached and cached[1] == len(examples):
+        # Same sample count as last time this voice was built — reuse it.
+        return {"voice_id": cached[0]}
+
+    # Sample set changed (or no cache yet) — (re)build the cloned voice.
+    # If we're replacing an old voice, delete it from ElevenLabs first so
+    # we don't silently accumulate orphaned voices against the account's
+    # voice-slot limit (free tier: 3 instant clone slots).
+    if cached:
+        try:
+            requests.delete(
+                f"{ELEVENLABS_API_BASE}/voices/{cached[0]}",
+                headers={"xi-api-key": ELEVENLABS_API_KEY},
+                timeout=15,
+            )
+        except requests.RequestException:
+            pass  # best-effort cleanup; not fatal if it fails
+
+    files = [
+        ("files", (f"sample_{i}.{ex['mime_type'].split('/')[-1] or 'webm'}", ex["data"], ex["mime_type"]))
+        for i, ex in enumerate(examples)
+    ]
+
+    try:
+        resp = requests.post(
+            f"{ELEVENLABS_API_BASE}/voices/add",
+            headers={"xi-api-key": ELEVENLABS_API_KEY},
+            data={
+                "name": f"SALINGO {language}",
+                "description": f"Auto-cloned SALINGO pronunciation voice for {language}",
+            },
+            files=files,
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        return {"error": f"Could not reach ElevenLabs: {e}"}
+
+    if resp.status_code >= 400:
+        detail = resp.text[:300]
+        return {"error": f"ElevenLabs voice creation failed ({resp.status_code}): {detail}"}
+
+    voice_id = resp.json().get("voice_id")
+    if not voice_id:
+        return {"error": "ElevenLabs did not return a voice_id."}
+
+    _cache_voice_id(language_key, voice_id, len(examples))
+    return {"voice_id": voice_id}
 
 
 def synthesize_speech(text: str, language: str) -> dict:
     """
-    Synthesize `text` spoken in `language`, cloning the voice from the
-    trained pronunciation samples in audio_training/<language>/ (the
-    same samples collected by train_audio_sample() for STT calibration).
-
-    This is how languages with no OS/browser TTS voice (e.g. Kapampangan)
-    can still be "spoken" â€” the voice comes from real recorded samples of
-    a speaker of that language, not from a pre-built system voice.
+    Synthesize `text` spoken in `language`, using an ElevenLabs voice cloned
+    from the trained pronunciation samples in Supabase's "recordingManagement"
+    table. This is how languages with no OS/browser TTS voice (e.g.
+    Kapampangan) can still be "spoken" on the frontend — the voice comes
+    from real recorded samples of a speaker of that language, not from a
+    pre-built system voice.
 
     Returns: {"success": bool, "audio": bytes | None, "mime_type": str,
               "message": str}
@@ -962,66 +1028,42 @@ def synthesize_speech(text: str, language: str) -> dict:
     if not text:
         return {"success": False, "audio": None, "mime_type": "", "message": "No text to speak."}
 
-    reference_clip = _prepare_reference_clip(language)
-    if reference_clip is None:
-        return {
-            "success": False,
-            "audio": None,
-            "mime_type": "",
-            "message": (
-                f"No voice samples trained for '{language}' yet. Record a few short, clear "
-                "clips via the pronunciation trainer first â€” even 3-5 short samples from one "
-                "speaker are enough to clone a voice from."
-            ),
-        }
+    voice_result = _get_or_create_elevenlabs_voice(language)
+    if "error" in voice_result:
+        return {"success": False, "audio": None, "mime_type": "", "message": voice_result["error"]}
 
-    language_key = language.strip().lower()
-    xtts_lang = XTTS_LANGUAGE_FALLBACK.get(language_key, "en")
-
-    # XTTS-v2 has no native Kapampangan phoneme/language code. The current
-    # project therefore uses Tagalog (tl) only as the closest text-processing
-    # fallback. The speaker identity still comes from the user's recording.
-    # This is intentionally explicit so a future Kapampangan-capable TTS model
-    # can replace the fallback without changing the API or translate.php.
+    voice_id = voice_result["voice_id"]
 
     try:
-        model = _get_tts_model()
-    except Exception as e:
-        return {
-            "success": False,
-            "audio": None,
-            "mime_type": "",
-            "message": f"TTS engine unavailable: {e}",
-        }
-
-    tmp_dir = Path(tempfile.mkdtemp())
-    out_path = tmp_dir / "speech.wav"
-    try:
-        model.tts_to_file(
-            text=text,
-            speaker_wav=str(reference_clip),
-            language=xtts_lang,
-            file_path=str(out_path),
+        resp = requests.post(
+            f"{ELEVENLABS_API_BASE}/text-to-speech/{voice_id}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": text,
+                "model_id": ELEVENLABS_TTS_MODEL,
+            },
+            timeout=60,
         )
-        with open(out_path, "rb") as f:
-            audio_bytes = f.read()
-    except Exception as e:
+    except requests.RequestException as e:
+        return {"success": False, "audio": None, "mime_type": "", "message": f"Could not reach ElevenLabs: {e}"}
+
+    if resp.status_code >= 400:
+        detail = resp.text[:300]
         return {
             "success": False,
             "audio": None,
             "mime_type": "",
-            "message": f"Speech synthesis failed: {e}",
+            "message": f"Speech synthesis failed ({resp.status_code}): {detail}",
         }
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        # reference_clip lives in its own temp dir (downloaded fresh from
-        # Supabase in _prepare_reference_clip) — clean that up too.
-        shutil.rmtree(reference_clip.parent, ignore_errors=True)
 
     return {
         "success": True,
-        "audio": audio_bytes,
-        "mime_type": "audio/wav",
+        "audio": resp.content,
+        "mime_type": "audio/mpeg",
         "message": "ok",
     }
 
