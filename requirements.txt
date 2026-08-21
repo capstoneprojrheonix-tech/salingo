@@ -8,6 +8,4 @@ openpyxl
 numpy
 python-dotenv
 psycopg2-binary
-coqui-tts
-torch
-torchaudio
+requests
