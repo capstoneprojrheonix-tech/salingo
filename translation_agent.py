@@ -22,7 +22,6 @@ Supported training file formats: .csv, .xlsx, .pdf (glossary-style).
 import os
 import re
 import json
-import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -39,13 +38,18 @@ from pypdf import PdfReader
 load_dotenv()
 
 BASE_DIR = Path(__file__).parent
-VECTORSTORE_DIR = BASE_DIR / "vectorstores"
-VECTORSTORE_DIR.mkdir(exist_ok=True)
 
-# Pronunciation/voice recordings (used to be a local audio_training/<lang>/
-# folder — moved to Supabase Postgres's "recordingManagement" table so
-# recordings survive redeploys/restarts/spin-downs on hosts with an
-# ephemeral filesystem (e.g. Render's free tier).
+# Translation memory (RAG embeddings) used to live on local disk under
+# BASE_DIR/vectorstores/<pair>/{embeddings.npy,metadata.json,info.json}.
+# That's what caused trained datasets to "disappear" after the Render
+# service slept/redeployed/restarted: Render's free-tier filesystem is
+# EPHEMERAL — a new container is spun up from the last deployed image on
+# every restart, so any files written to local disk after deploy (i.e.
+# every uploaded dataset) are wiped, exactly like the audio recordings
+# used to be before those were moved to Supabase's "recordingManagement"
+# table. Translation memory now lives in Supabase's "translationMemory"
+# table for the same reason — see salingo_supabase_migration.sql for the
+# CREATE TABLE statement.
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 
 
@@ -221,22 +225,6 @@ def _slug(name: str) -> str:
 def _pair_slug(lang_a: str, lang_b: str) -> str:
     a, b = sorted([_slug(lang_a), _slug(lang_b)])
     return f"{a}__{b}"
-
-
-def _store_path(lang_a: str, lang_b: str) -> Path:
-    return VECTORSTORE_DIR / _pair_slug(lang_a, lang_b)
-
-
-def _embeddings_file(store_path: Path) -> Path:
-    return store_path / "embeddings.npy"
-
-
-def _metadata_file(store_path: Path) -> Path:
-    return store_path / "metadata.json"
-
-
-def _info_file(store_path: Path) -> Path:
-    return store_path / "info.json"
 
 
 # ---------------------------------------------------------------------
@@ -543,18 +531,61 @@ def _embed_texts(texts: list[str]) -> np.ndarray:
     return np.array(vectors, dtype=np.float32)
 
 
-def _load_store(store_path: Path) -> tuple[np.ndarray, list[dict]]:
-    embeddings = np.load(_embeddings_file(store_path))
-    with open(_metadata_file(store_path), "r", encoding="utf-8") as f:
-        metadata = json.load(f)
+def _load_pair_from_db(lang_a: str, lang_b: str) -> tuple[np.ndarray, list[dict]]:
+    """
+    Loads every trained example for this language pair (both directions)
+    from Supabase's "translationMemory" table. Returns an (embeddings,
+    metadata) tuple matching the old local-file store's shape, so the
+    retrieval logic in translate_text() doesn't need to change.
+    """
+    pair_slug = _pair_slug(lang_a, lang_b)
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT "SourceLang", "TargetLang", "SourceText", "TargetText", "Embedding" '
+                'FROM "translationMemory" WHERE "PairSlug" = %s',
+                (pair_slug,),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    metadata = [
+        {"source_lang": r[0], "target_lang": r[1], "source_text": r[2], "target_text": r[3]}
+        for r in rows
+    ]
+    embeddings = np.array([r[4] for r in rows], dtype=np.float32)
     return embeddings, metadata
 
 
-def _save_store(store_path: Path, embeddings: np.ndarray, metadata: list[dict]):
-    store_path.mkdir(parents=True, exist_ok=True)
-    np.save(_embeddings_file(store_path), embeddings)
-    with open(_metadata_file(store_path), "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False)
+def _save_pairs_to_db(lang_a: str, lang_b: str, metadata: list[dict], embeddings: np.ndarray):
+    """Appends newly-trained examples for this pair into Supabase (does not
+    touch any existing rows — training is additive, same as before)."""
+    pair_slug = _pair_slug(lang_a, lang_b)
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            for meta, emb in zip(metadata, embeddings):
+                cur.execute(
+                    """
+                    INSERT INTO "translationMemory"
+                        ("PairSlug", "LangA", "LangB", "SourceLang", "TargetLang", "SourceText", "TargetText", "Embedding")
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        pair_slug, lang_a, lang_b,
+                        meta["source_lang"], meta["target_lang"],
+                        meta["source_text"], meta["target_text"],
+                        emb.tolist(),
+                    ),
+                )
+            conn.commit()
+    finally:
+        conn.close()
 
 
 def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict:
@@ -617,18 +648,10 @@ def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict
     except Exception as e:
         return {"success": False, "count": 0, "message": f"Embedding request failed: {e}"}
 
-    store_path = _store_path(lang_a, lang_b)
-    if _embeddings_file(store_path).exists():
-        existing_embeddings, existing_metadata = _load_store(store_path)
-        all_embeddings = np.vstack([existing_embeddings, new_embeddings])
-        all_metadata = existing_metadata + metadata
-    else:
-        all_embeddings = new_embeddings
-        all_metadata = metadata
-
-    _save_store(store_path, all_embeddings, all_metadata)
-    with open(_info_file(store_path), "w", encoding="utf-8") as f:
-        json.dump({"lang_a": lang_a, "lang_b": lang_b}, f, ensure_ascii=False)
+    try:
+        _save_pairs_to_db(lang_a, lang_b, metadata, new_embeddings)
+    except Exception as e:
+        return {"success": False, "count": 0, "message": f"Could not save to translation memory: {e}"}
 
     message = f"Trained on {len(pairs)} pairs for '{lang_a}' <-> '{lang_b}' (from {ext} file)."
     if note:
@@ -644,33 +667,42 @@ def train_language(lang_a: str, file_path: str, lang_b: str = "English") -> dict
 
 
 def language_pair_is_trained(lang_a: str, lang_b: str) -> bool:
-    return _embeddings_file(_store_path(lang_a, lang_b)).exists()
+    pair_slug = _pair_slug(lang_a, lang_b)
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT 1 FROM "translationMemory" WHERE "PairSlug" = %s LIMIT 1', (pair_slug,))
+            return cur.fetchone() is not None
+    finally:
+        conn.close()
 
 
 def list_trained_languages() -> list[str]:
-    """Returns human-readable pair labels, e.g. ['Kapampangan â†” Tagalog', 'Tagalog â†” English']."""
-    if not VECTORSTORE_DIR.exists():
-        return []
-    labels = []
-    for p in VECTORSTORE_DIR.iterdir():
-        if not (p.is_dir() and _embeddings_file(p).exists()):
-            continue
-        info_path = _info_file(p)
-        if info_path.exists():
-            with open(info_path, "r", encoding="utf-8") as f:
-                info = json.load(f)
-            labels.append(f"{info['lang_a']} â†” {info['lang_b']}")
-        else:
-            labels.append(p.name.replace("__", " â†” "))
-    return labels
+    """Returns human-readable pair labels, e.g. ['Kapampangan ↔ Tagalog', 'Tagalog ↔ English']."""
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                'SELECT DISTINCT ON ("PairSlug") "PairSlug", "LangA", "LangB" '
+                'FROM "translationMemory" ORDER BY "PairSlug", "Id" ASC'
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return [f"{lang_a} ↔ {lang_b}" for _, lang_a, lang_b in rows]
 
 
 def delete_language_pair(lang_a: str, lang_b: str) -> bool:
-    path = _store_path(lang_a, lang_b)
-    if path.exists():
-        shutil.rmtree(path)
-        return True
-    return False
+    pair_slug = _pair_slug(lang_a, lang_b)
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('DELETE FROM "translationMemory" WHERE "PairSlug" = %s', (pair_slug,))
+            deleted = cur.rowcount > 0
+            conn.commit()
+    finally:
+        conn.close()
+    return deleted
 
 
 # ---------------------------------------------------------------------
@@ -706,12 +738,11 @@ def translate_text(
     Works for ANY language pair (e.g. Kapampangan -> Tagalog), not just
     a fixed "-> English" direction.
     """
-    store_path = _store_path(source_language, target_language)
     examples: list[dict] = []
-    trained = _embeddings_file(store_path).exists()
+    trained = language_pair_is_trained(source_language, target_language)
 
     if trained:
-        embeddings, metadata = _load_store(store_path)
+        embeddings, metadata = _load_pair_from_db(source_language, target_language)
         direction_indices = [
             i for i, m in enumerate(metadata)
             if m["source_lang"].strip().lower() == source_language.strip().lower()
