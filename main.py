@@ -20,12 +20,14 @@ Backward compatibility notes:
     to translate/train between ANY two languages, e.g. Kapampangan <-> Tagalog.
 """
 
+import os
+import hmac
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -91,158 +93,3 @@ def train(
     allowed_ext = (".csv", ".xlsx", ".xlsm", ".pdf", ".txt")
     if not file.filename.lower().endswith(allowed_ext):
         raise HTTPException(400, f"Only {', '.join(allowed_ext)} files are supported")
-
-    tmp_dir = Path(tempfile.mkdtemp())
-    tmp_path = tmp_dir / file.filename
-    try:
-        with open(tmp_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        result = agent.train_language(language, str(tmp_path), target_language)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    if not result["success"]:
-        raise HTTPException(400, result["message"])
-
-    return result
-
-
-@app.post("/translate-audio")
-def translate_audio(
-    source_language: str = Form(...),
-    target_language: str = Form(...),
-    audio: UploadFile = File(...),
-):
-    mime_type = audio.content_type or "audio/webm"
-
-    tmp_dir = Path(tempfile.mkdtemp())
-    tmp_path = tmp_dir / (audio.filename or "recording.webm")
-    try:
-        with open(tmp_path, "wb") as f:
-            shutil.copyfileobj(audio.file, f)
-
-        try:
-            result = agent.transcribe_and_translate_audio(
-                str(tmp_path), mime_type, source_language, target_language
-            )
-        except Exception as e:
-            raise HTTPException(500, f"Audio translation failed: {e}")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    return result
-
-
-@app.post("/train-audio")
-def train_audio(
-    language: str = Form(...),
-    transcript: str = Form(...),
-    audio: UploadFile = File(...),
-):
-    mime_type = audio.content_type or "audio/webm"
-
-    tmp_dir = Path(tempfile.mkdtemp())
-    tmp_path = tmp_dir / (audio.filename or "sample.webm")
-    try:
-        with open(tmp_path, "wb") as f:
-            shutil.copyfileobj(audio.file, f)
-
-        result = agent.train_audio_sample(language, str(tmp_path), mime_type, transcript)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    if not result["success"]:
-        raise HTTPException(400, result["message"])
-
-    return result
-
-
-@app.post("/synthesize-speech")
-def synthesize_speech(
-    text: str = Form(...),
-    language: str = Form(...),
-):
-    """
-    Voice-clones speech for `language` from the trained pronunciation
-    samples in audio_training/<language>/ (same corpus collected via
-    /train-audio). Lets languages with no OS/browser TTS voice — e.g.
-    Kapampangan — still be spoken aloud on the frontend.
-    """
-    result = agent.synthesize_speech(text, language)
-
-    if not result["success"]:
-        raise HTTPException(400, result["message"])
-
-    return Response(content=result["audio"], media_type=result["mime_type"])
-
-
-@app.get("/audio-samples")
-def audio_samples(language: str):
-    return {"language": language, "samples": agent.list_audio_samples(language)}
-
-
-@app.delete("/audio-samples")
-def delete_audio_sample(language: str, sample_id: str):
-    deleted = agent.delete_audio_sample(language, sample_id)
-    if not deleted:
-        raise HTTPException(404, "Pronunciation sample not found")
-    return {"success": True, "message": "Pronunciation sample deleted"}
-
-
-@app.delete("/languages")
-def delete_language_pair(language: str, target_language: str = "English"):
-    deleted = agent.delete_language_pair(language, target_language)
-    if not deleted:
-        raise HTTPException(404, "Language pair not found / not trained yet")
-    return {"success": True, "message": f"Deleted training data for '{language}' <-> '{target_language}'"}
-
-
-# ---------------------------------------------------------------------
-# languageManagement (admin dashboard rows, Supabase-backed)
-# ---------------------------------------------------------------------
-# Used by languageManagement.php on InfinityFree, which can't reach
-# Supabase directly (outbound DB ports are blocked on InfinityFree).
-# These routes are plain CRUD over the "languageManagement" table —
-# they don't touch the RAG translation memory (that's /train and the
-# /languages routes above).
-
-class LanguageRecordUpdate(BaseModel):
-    language_name: str
-    status: str
-    file_name: Optional[str] = None
-    translation: Optional[int] = None
-
-
-@app.post("/language-records")
-def create_language_record(
-    language_name: str = Form(...),
-    translation: int = Form(0),
-    file_name: str = Form(""),
-    status: str = Form("Active"),
-):
-    new_id = agent.db_insert_language_record(language_name, translation, file_name, status)
-    return {"success": True, "id": new_id}
-
-
-@app.get("/language-records")
-def list_language_records():
-    return {"records": agent.db_list_language_records()}
-
-
-@app.get("/language-records/{record_id}")
-def get_language_record(record_id: int):
-    record = agent.db_get_language_record(record_id)
-    if record is None:
-        raise HTTPException(404, "Language record not found")
-    return record
-
-
-@app.put("/language-records/{record_id}")
-def update_language_record(record_id: int, body: LanguageRecordUpdate):
-    updated = agent.db_update_language_record(
-        record_id, body.language_name, body.status, body.file_name, body.translation
-    )
-    if not updated:
-        raise HTTPException(404, "Language record not found")
-    return {"success": True}
