@@ -4,26 +4,21 @@ SALINGO Translation Service (FastAPI)
 Run with:
     uvicorn main:app --host 0.0.0.0 --port 8000
 
-This service is meant to run on its own host/server. languageManagement.php
-(via ai_bridge.php) and translate.php both call this over HTTP instead of
-calling Gemini directly.
+This service is meant to run on its own host/server.
+languageManagement.php (via ai_bridge.php) and translate.php
+both call this over HTTP instead of calling Gemini directly.
 
 Backward compatibility notes:
-  - /translate still accepts the old {language, direction} shape used by
-    ai_bridge.php's translateText(). If `target_language` is omitted, the
-    old direction ("to_english" / "from_english") is used to infer it,
-    defaulting to English.
-  - /train still accepts the old {language, file} shape used by
-    ai_bridge.php's trainSalingoAI(). If `target_language` is omitted, it
-    defaults to "English" (same behavior as before).
-  - New callers (like translate.php) can pass `target_language` directly
-    to translate/train between ANY two languages, e.g. Kapampangan <-> Tagalog.
+  - /translate still accepts the old {language, direction} shape.
+  - /train still accepts the old {language, file} shape.
+  - New callers can pass target_language directly.
 """
 
 import os
 import hmac
 import shutil
 import tempfile
+
 from pathlib import Path
 from typing import Optional
 
@@ -36,12 +31,21 @@ from fastapi import (
     Response,
     Header,
 )
+
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 import translation_agent as agent
 
-app = FastAPI(title="SALINGO Translation Service")
+
+# ============================================================
+# FastAPI app
+# ============================================================
+
+app = FastAPI(
+    title="SALINGO Translation Service"
+)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,9 +54,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------
+
+# ============================================================
+# Request models
+# ============================================================
+
+class TranslateRequest(BaseModel):
+    text: str
+    language: str
+    target_language: Optional[str] = None
+    direction: str = "to_english"
+
+
+class DeviceRegisterRequest(BaseModel):
+    device_id: str
+    mac_address: str
+    firmware_version: str = "unknown"
+
+
+class DeviceHeartbeatRequest(BaseModel):
+    device_id: str
+    mac_address: str = ""
+    firmware_version: str = "unknown"
+    wifi_rssi: Optional[int] = None
+    battery_percent: Optional[int] = None
+
+
+class LanguageRecordUpdate(BaseModel):
+    language_name: str
+    status: str
+    file_name: Optional[str] = None
+    translation: Optional[int] = None
+
+
+# ============================================================
 # SALINGO physical device authentication
-# ---------------------------------------------------------------------
+# ============================================================
 
 SALINGO_DEVICE_SECRET = os.getenv(
     "SALINGO_DEVICE_SECRET",
@@ -72,7 +109,10 @@ def _require_device_auth(
 
     prefix = "Bearer "
 
-    if not authorization or not authorization.startswith(prefix):
+    if (
+        not authorization
+        or not authorization.startswith(prefix)
+    ):
         raise HTTPException(
             401,
             "Missing device authorization"
@@ -89,18 +129,56 @@ def _require_device_auth(
             "Invalid device authorization"
         )
 
+
+# ============================================================
+# Health
+# ============================================================
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok"
+    }
+
+
+# ============================================================
+# SALINGO physical device API
+# ============================================================
+
 @app.post("/api/device/register")
 def register_device(
     body: DeviceRegisterRequest,
     authorization: Optional[str] = Header(default=None),
 ):
-    _require_device_auth(authorization)
-
-    device = agent.db_register_device(
-        body.device_id.strip(),
-        body.mac_address.strip(),
-        body.firmware_version.strip() or "unknown",
+    _require_device_auth(
+        authorization
     )
+
+    if not body.device_id.strip():
+        raise HTTPException(
+            400,
+            "device_id is required"
+        )
+
+    if not body.mac_address.strip():
+        raise HTTPException(
+            400,
+            "mac_address is required"
+        )
+
+    try:
+        device = agent.db_register_device(
+            body.device_id.strip(),
+            body.mac_address.strip(),
+            body.firmware_version.strip()
+            or "unknown",
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            500,
+            f"Device registration failed: {e}"
+        )
 
     return {
         "success": True,
@@ -113,15 +191,33 @@ def device_heartbeat(
     body: DeviceHeartbeatRequest,
     authorization: Optional[str] = Header(default=None),
 ):
-    _require_device_auth(authorization)
-
-    device = agent.db_heartbeat_device(
-        device_id=body.device_id.strip(),
-        mac_address=body.mac_address.strip(),
-        firmware_version=body.firmware_version.strip() or "unknown",
-        wifi_rssi=body.wifi_rssi,
-        battery_percent=body.battery_percent,
+    _require_device_auth(
+        authorization
     )
+
+    if not body.device_id.strip():
+        raise HTTPException(
+            400,
+            "device_id is required"
+        )
+
+    try:
+        device = agent.db_heartbeat_device(
+            device_id=body.device_id.strip(),
+            mac_address=body.mac_address.strip(),
+            firmware_version=(
+                body.firmware_version.strip()
+                or "unknown"
+            ),
+            wifi_rssi=body.wifi_rssi,
+            battery_percent=body.battery_percent,
+        )
+
+    except Exception as e:
+        raise HTTPException(
+            500,
+            f"Device heartbeat failed: {e}"
+        )
 
     return {
         "success": True,
@@ -133,93 +229,27 @@ def device_heartbeat(
 def list_devices(
     authorization: Optional[str] = Header(default=None),
 ):
-    _require_device_auth(authorization)
+    _require_device_auth(
+        authorization
+    )
+
+    try:
+        devices = agent.db_list_devices()
+
+    except Exception as e:
+        raise HTTPException(
+            500,
+            f"Could not list devices: {e}"
+        )
 
     return {
-        "devices": agent.db_list_devices()
+        "devices": devices
     }
-    
-class TranslateRequest(BaseModel):
-    text: str
-    language: str
-    target_language: Optional[str] = None
-    direction: str = "to_english"  # legacy: "to_english" or "from_english"
-
-class DeviceRegisterRequest(BaseModel):
-    device_id: str
-    mac_address: str
-    firmware_version: str = "unknown"
 
 
-class DeviceHeartbeatRequest(BaseModel):
-    device_id: str
-    mac_address: str = ""
-    firmware_version: str = "unknown"
-    wifi_rssi: Optional[int] = None
-    battery_percent: Optional[int] = None
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/languages")
-def languages():
-    return {"trained_languages": agent.list_trained_languages()}
-
-
-@app.post("/translate")
-def translate(req: TranslateRequest):
-    if not req.text.strip():
-        raise HTTPException(400, "text is empty")
-
-    if req.target_language:
-        source_language = req.language
-        target_language = req.target_language
-    else:
-        if req.direction not in ("to_english", "from_english"):
-            raise HTTPException(400, "direction must be 'to_english' or 'from_english'")
-        if req.direction == "to_english":
-            source_language, target_language = req.language, "English"
-        else:
-            source_language, target_language = "English", req.language
-
-    try:
-        result = agent.translate_text(req.text, source_language, target_language)
-    except Exception as e:
-        raise HTTPException(500, f"Translation failed: {e}")
-
-    return result
-
-
-@app.post("/train")
-def train(
-    language: str = Form(...),
-    target_language: str = Form("English"),
-    file: UploadFile = File(...),
-):
-    allowed_ext = (".csv", ".xlsx", ".xlsm", ".pdf", ".txt")
-    if not file.filename.lower().endswith(allowed_ext):
-        raise HTTPException(400, f"Only {', '.join(allowed_ext)} files are supported")
-
-    tmp_dir = Path(tempfile.mkdtemp())
-    tmp_path = tmp_dir / file.filename
-    try:
-        with open(tmp_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-
-        result = agent.train_language(language, str(tmp_path), target_language)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    if not result["success"]:
-        raise HTTPException(400, result["message"])
-
-    return result
-
-# ---------------------------------------------------------------------
+# ============================================================
 # ESP32 speech-to-text
-# ---------------------------------------------------------------------
+# ============================================================
 
 @app.post("/api/device/transcribe")
 def device_transcribe(
@@ -227,19 +257,32 @@ def device_transcribe(
     audio: UploadFile = File(...),
     authorization: Optional[str] = Header(default=None),
 ):
-    _require_device_auth(authorization)
+    _require_device_auth(
+        authorization
+    )
 
-    mime_type = audio.content_type or "audio/wav"
+    mime_type = (
+        audio.content_type
+        or "audio/wav"
+    )
 
-    tmp_dir = Path(tempfile.mkdtemp())
+    tmp_dir = Path(
+        tempfile.mkdtemp()
+    )
 
     tmp_path = tmp_dir / (
-        audio.filename or "recording.wav"
+        audio.filename
+        or "recording.wav"
     )
 
     try:
-        # Save the WAV uploaded by the ESP32.
-        with open(tmp_path, "wb") as f:
+
+        # Save the WAV uploaded by the ESP32
+        with open(
+            tmp_path,
+            "wb"
+        ) as f:
+
             shutil.copyfileobj(
                 audio.file,
                 f
@@ -269,31 +312,226 @@ def device_transcribe(
         "transcript": transcript,
     }
 
+
+# ============================================================
+# Languages
+# ============================================================
+
+@app.get("/languages")
+def languages():
+
+    return {
+        "trained_languages":
+            agent.list_trained_languages()
+    }
+
+
+# ============================================================
+# Text translation
+# ============================================================
+
+@app.post("/translate")
+def translate(
+    req: TranslateRequest
+):
+
+    if not req.text.strip():
+        raise HTTPException(
+            400,
+            "text is empty"
+        )
+
+    if req.target_language:
+
+        source_language = req.language
+        target_language = req.target_language
+
+    else:
+
+        if req.direction not in (
+            "to_english",
+            "from_english"
+        ):
+            raise HTTPException(
+                400,
+                "direction must be "
+                "'to_english' or 'from_english'"
+            )
+
+        if req.direction == "to_english":
+
+            source_language = req.language
+            target_language = "English"
+
+        else:
+
+            source_language = "English"
+            target_language = req.language
+
+    try:
+
+        result = agent.translate_text(
+            req.text,
+            source_language,
+            target_language
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            500,
+            f"Translation failed: {e}"
+        )
+
+    return result
+
+
+# ============================================================
+# Train translation datasets
+# ============================================================
+
+@app.post("/train")
+def train(
+    language: str = Form(...),
+    target_language: str = Form("English"),
+    file: UploadFile = File(...),
+):
+
+    allowed_ext = (
+        ".csv",
+        ".xlsx",
+        ".xlsm",
+        ".pdf",
+        ".txt",
+    )
+
+    filename = (
+        file.filename
+        or "upload"
+    )
+
+    if not filename.lower().endswith(
+        allowed_ext
+    ):
+        raise HTTPException(
+            400,
+            "Only "
+            + ", ".join(allowed_ext)
+            + " files are supported"
+        )
+
+    tmp_dir = Path(
+        tempfile.mkdtemp()
+    )
+
+    tmp_path = (
+        tmp_dir
+        / filename
+    )
+
+    try:
+
+        with open(
+            tmp_path,
+            "wb"
+        ) as f:
+
+            shutil.copyfileobj(
+                file.file,
+                f
+            )
+
+        result = agent.train_language(
+            language,
+            str(tmp_path),
+            target_language
+        )
+
+    finally:
+
+        shutil.rmtree(
+            tmp_dir,
+            ignore_errors=True
+        )
+
+    if not result["success"]:
+
+        raise HTTPException(
+            400,
+            result["message"]
+        )
+
+    return result
+
+
+# ============================================================
+# Website/browser audio translation
+# ============================================================
+
 @app.post("/translate-audio")
 def translate_audio(
     source_language: str = Form(...),
     target_language: str = Form(...),
     audio: UploadFile = File(...),
 ):
-    mime_type = audio.content_type or "audio/webm"
 
-    tmp_dir = Path(tempfile.mkdtemp())
-    tmp_path = tmp_dir / (audio.filename or "recording.webm")
+    mime_type = (
+        audio.content_type
+        or "audio/webm"
+    )
+
+    tmp_dir = Path(
+        tempfile.mkdtemp()
+    )
+
+    tmp_path = tmp_dir / (
+        audio.filename
+        or "recording.webm"
+    )
+
     try:
-        with open(tmp_path, "wb") as f:
-            shutil.copyfileobj(audio.file, f)
+
+        with open(
+            tmp_path,
+            "wb"
+        ) as f:
+
+            shutil.copyfileobj(
+                audio.file,
+                f
+            )
 
         try:
-            result = agent.transcribe_and_translate_audio(
-                str(tmp_path), mime_type, source_language, target_language
+
+            result = (
+                agent.transcribe_and_translate_audio(
+                    str(tmp_path),
+                    mime_type,
+                    source_language,
+                    target_language
+                )
             )
+
         except Exception as e:
-            raise HTTPException(500, f"Audio translation failed: {e}")
+
+            raise HTTPException(
+                500,
+                f"Audio translation failed: {e}"
+            )
+
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        shutil.rmtree(
+            tmp_dir,
+            ignore_errors=True
+        )
 
     return result
 
+
+# ============================================================
+# Pronunciation training
+# ============================================================
 
 @app.post("/train-audio")
 def train_audio(
@@ -301,86 +539,173 @@ def train_audio(
     transcript: str = Form(...),
     audio: UploadFile = File(...),
 ):
-    mime_type = audio.content_type or "audio/webm"
 
-    tmp_dir = Path(tempfile.mkdtemp())
-    tmp_path = tmp_dir / (audio.filename or "sample.webm")
+    mime_type = (
+        audio.content_type
+        or "audio/webm"
+    )
+
+    tmp_dir = Path(
+        tempfile.mkdtemp()
+    )
+
+    tmp_path = tmp_dir / (
+        audio.filename
+        or "sample.webm"
+    )
+
     try:
-        with open(tmp_path, "wb") as f:
-            shutil.copyfileobj(audio.file, f)
 
-        result = agent.train_audio_sample(language, str(tmp_path), mime_type, transcript)
+        with open(
+            tmp_path,
+            "wb"
+        ) as f:
+
+            shutil.copyfileobj(
+                audio.file,
+                f
+            )
+
+        result = agent.train_audio_sample(
+            language,
+            str(tmp_path),
+            mime_type,
+            transcript
+        )
+
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        shutil.rmtree(
+            tmp_dir,
+            ignore_errors=True
+        )
 
     if not result["success"]:
-        raise HTTPException(400, result["message"])
+
+        raise HTTPException(
+            400,
+            result["message"]
+        )
 
     return result
 
+
+# ============================================================
+# Text-to-speech
+# ============================================================
 
 @app.post("/synthesize-speech")
 def synthesize_speech(
     text: str = Form(...),
     language: str = Form(...),
 ):
-    """
-    Voice-clones speech for `language` from the trained pronunciation
-    samples in audio_training/<language>/ (same corpus collected via
-    /train-audio). Lets languages with no OS/browser TTS voice — e.g.
-    Kapampangan — still be spoken aloud on the frontend.
-    """
-    result = agent.synthesize_speech(text, language)
+
+    result = agent.synthesize_speech(
+        text,
+        language
+    )
 
     if not result["success"]:
-        raise HTTPException(400, result["message"])
+
+        raise HTTPException(
+            400,
+            result["message"]
+        )
 
     return Response(
         content=result["audio"],
         media_type=result["mime_type"],
         headers={
-            "X-Sample-Rate": str(result["sample_rate"]),
-            "X-Audio-Format": "pcm_s16le",
+            "X-Sample-Rate":
+                str(result["sample_rate"]),
+
+            "X-Audio-Format":
+                "pcm_s16le",
         },
     )
 
 
+# ============================================================
+# Audio sample management
+# ============================================================
+
 @app.get("/audio-samples")
-def audio_samples(language: str):
-    return {"language": language, "samples": agent.list_audio_samples(language)}
+def audio_samples(
+    language: str
+):
+
+    return {
+        "language": language,
+        "samples":
+            agent.list_audio_samples(
+                language
+            )
+    }
 
 
 @app.delete("/audio-samples")
-def delete_audio_sample(language: str, sample_id: str):
-    deleted = agent.delete_audio_sample(language, sample_id)
-    if not deleted:
-        raise HTTPException(404, "Pronunciation sample not found")
-    return {"success": True, "message": "Pronunciation sample deleted"}
+def delete_audio_sample(
+    language: str,
+    sample_id: str
+):
 
+    deleted = (
+        agent.delete_audio_sample(
+            language,
+            sample_id
+        )
+    )
+
+    if not deleted:
+
+        raise HTTPException(
+            404,
+            "Pronunciation sample not found"
+        )
+
+    return {
+        "success": True,
+        "message":
+            "Pronunciation sample deleted"
+    }
+
+
+# ============================================================
+# Delete trained language pair
+# ============================================================
 
 @app.delete("/languages")
-def delete_language_pair(language: str, target_language: str = "English"):
-    deleted = agent.delete_language_pair(language, target_language)
+def delete_language_pair(
+    language: str,
+    target_language: str = "English",
+):
+
+    deleted = (
+        agent.delete_language_pair(
+            language,
+            target_language
+        )
+    )
+
     if not deleted:
-        raise HTTPException(404, "Language pair not found / not trained yet")
-    return {"success": True, "message": f"Deleted training data for '{language}' <-> '{target_language}'"}
+
+        raise HTTPException(
+            404,
+            "Language pair not found / not trained yet"
+        )
+
+    return {
+        "success": True,
+        "message":
+            f"Deleted training data for "
+            f"'{language}' <-> "
+            f"'{target_language}'"
+    }
 
 
-# ---------------------------------------------------------------------
-# languageManagement (admin dashboard rows, Supabase-backed)
-# ---------------------------------------------------------------------
-# Used by languageManagement.php on InfinityFree, which can't reach
-# Supabase directly (outbound DB ports are blocked on InfinityFree).
-# These routes are plain CRUD over the "languageManagement" table —
-# they don't touch the RAG translation memory (that's /train and the
-# /languages routes above).
-
-class LanguageRecordUpdate(BaseModel):
-    language_name: str
-    status: str
-    file_name: Optional[str] = None
-    translation: Optional[int] = None
-
+# ============================================================
+# languageManagement admin dashboard
+# ============================================================
 
 @app.post("/language-records")
 def create_language_record(
@@ -389,28 +714,79 @@ def create_language_record(
     file_name: str = Form(""),
     status: str = Form("Active"),
 ):
-    new_id = agent.db_insert_language_record(language_name, translation, file_name, status)
-    return {"success": True, "id": new_id}
+
+    new_id = (
+        agent.db_insert_language_record(
+            language_name,
+            translation,
+            file_name,
+            status
+        )
+    )
+
+    return {
+        "success": True,
+        "id": new_id
+    }
 
 
 @app.get("/language-records")
 def list_language_records():
-    return {"records": agent.db_list_language_records()}
+
+    return {
+        "records":
+            agent.db_list_language_records()
+    }
 
 
-@app.get("/language-records/{record_id}")
-def get_language_record(record_id: int):
-    record = agent.db_get_language_record(record_id)
+@app.get(
+    "/language-records/{record_id}"
+)
+def get_language_record(
+    record_id: int
+):
+
+    record = (
+        agent.db_get_language_record(
+            record_id
+        )
+    )
+
     if record is None:
-        raise HTTPException(404, "Language record not found")
+
+        raise HTTPException(
+            404,
+            "Language record not found"
+        )
+
     return record
 
 
-@app.put("/language-records/{record_id}")
-def update_language_record(record_id: int, body: LanguageRecordUpdate):
-    updated = agent.db_update_language_record(
-        record_id, body.language_name, body.status, body.file_name, body.translation
+@app.put(
+    "/language-records/{record_id}"
+)
+def update_language_record(
+    record_id: int,
+    body: LanguageRecordUpdate
+):
+
+    updated = (
+        agent.db_update_language_record(
+            record_id,
+            body.language_name,
+            body.status,
+            body.file_name,
+            body.translation
+        )
     )
+
     if not updated:
-        raise HTTPException(404, "Language record not found")
-    return {"success": True}
+
+        raise HTTPException(
+            404,
+            "Language record not found"
+        )
+
+    return {
+        "success": True
+    }
