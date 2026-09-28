@@ -19,10 +19,6 @@ same store (bidirectional).
 Supported training file formats: .csv, .xlsx, .pdf (glossary-style).
 """
 
-import torch
-
-from transformers import VitsModel, AutoTokenizer
-
 import os
 import re
 import json
@@ -212,140 +208,6 @@ MAX_VOICE_CLONE_SAMPLES = 5  # how many stored clips to submit when (re)building
 _premade_voice_cache: dict[str, str] = {}  # voice_name (lowercased) -> voice_id, in-memory only
 
 _client = None
-
-_mms_kapampangan_model = None
-_mms_kapampangan_tokenizer = None
-
-def get_kapampangan_tts():
-    global _mms_kapampangan_model
-    global _mms_kapampangan_tokenizer
-
-    if _mms_kapampangan_model is None:
-        print("Loading Kapampangan MMS TTS model...")
-
-        model_name = "facebook/mms-tts-pam"
-
-        _mms_kapampangan_tokenizer = AutoTokenizer.from_pretrained(
-            model_name
-        )
-
-        _mms_kapampangan_model = VitsModel.from_pretrained(
-            model_name
-        )
-
-        _mms_kapampangan_model.eval()
-
-        print("Kapampangan MMS TTS ready.")
-
-    return (
-        _mms_kapampangan_model,
-        _mms_kapampangan_tokenizer,
-    )
-
-
-def synthesize_kapampangan_mms(text: str) -> dict:
-    try:
-        model, tokenizer = get_kapampangan_tts()
-
-        inputs = tokenizer(
-            text,
-            return_tensors="pt"
-        )
-
-        torch.manual_seed(555)
-
-        with torch.no_grad():
-            output = model(**inputs)
-
-        waveform = output.waveform[0]
-
-        waveform = waveform.detach().cpu().numpy()
-
-        # Clamp floating-point waveform to -1.0 ... +1.0
-        waveform = np.clip(
-            waveform,
-            -1.0,
-            1.0
-        )
-
-        # Convert float audio to signed 16-bit PCM.
-        pcm = (
-            waveform * 32767.0
-        ).astype(np.int16)
-
-        return {
-            "success": True,
-            "audio": pcm.tobytes(),
-            "mime_type": "application/octet-stream",
-            "sample_rate": int(model.config.sampling_rate),
-            "message": "ok",
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "audio": b"",
-            "mime_type": "",
-            "sample_rate": 0,
-            "message": f"Kapampangan TTS failed: {e}",
-        }
-
-def synthesize_gemini_tts(
-    text: str,
-    language: str
-) -> dict:
-
-    try:
-        client = get_client()
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-preview-tts",
-            contents=(
-                f"Speak this naturally and clearly in "
-                f"{language}: {text}"
-            ),
-            config=types.GenerateContentConfig(
-                response_modalities=["AUDIO"],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=
-                            types.PrebuiltVoiceConfig(
-                                voice_name="Kore"
-                            )
-                    )
-                )
-            ),
-        )
-
-        part = response.candidates[0].content.parts[0]
-
-        audio = part.inline_data.data
-
-        if not audio:
-            return {
-                "success": False,
-                "audio": b"",
-                "mime_type": "",
-                "sample_rate": 0,
-                "message": "Gemini returned no audio.",
-            }
-
-        return {
-            "success": True,
-            "audio": audio,
-            "mime_type": "application/octet-stream",
-            "sample_rate": 24000,
-            "message": "ok",
-        }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "audio": b"",
-            "mime_type": "",
-            "sample_rate": 0,
-            "message": f"Gemini TTS failed: {e}",
-        }
 
 def get_client() -> genai.Client:
     global _client
@@ -1257,20 +1119,92 @@ def synthesize_speech(text: str, language: str) -> dict:
             "message": "No text to speak.",
         }
 
+    if not ELEVENLABS_API_KEY:
+        return {
+            "success": False,
+            "audio": b"",
+            "mime_type": "",
+            "sample_rate": 0,
+            "message": "ELEVENLABS_API_KEY is not configured.",
+        }
+
     lang = language.lower()
 
-    if lang in ("kapampangan", "pampanga", "pampangan"):
-        return synthesize_kapampangan_mms(text)
+    if lang not in (
+        "english",
+        "tagalog",
+        "filipino",
+        "kapampangan",
+        "pampanga",
+        "pampangan",
+    ):
+        return {
+            "success": False,
+            "audio": b"",
+            "mime_type": "",
+            "sample_rate": 0,
+            "message": f"TTS language not supported: {language}",
+        }
 
-    if lang in ("english", "tagalog", "filipino"):
-        return synthesize_gemini_tts(text, language)
+    voice_result = _get_or_create_elevenlabs_voice(language)
+
+    if "error" in voice_result:
+        return {
+            "success": False,
+            "audio": b"",
+            "mime_type": "",
+            "sample_rate": 0,
+            "message": voice_result["error"],
+        }
+
+    voice_id = voice_result["voice_id"]
+
+    try:
+        response = requests.post(
+            f"{ELEVENLABS_API_BASE}/text-to-speech/{voice_id}",
+            headers={
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Accept": "application/octet-stream",
+                "Content-Type": "application/json",
+            },
+            params={
+                "output_format": "pcm_16000",
+            },
+            json={
+                "text": text,
+                "model_id": ELEVENLABS_TTS_MODEL,
+            },
+            timeout=60,
+        )
+
+    except requests.RequestException as e:
+        return {
+            "success": False,
+            "audio": b"",
+            "mime_type": "",
+            "sample_rate": 0,
+            "message": f"Could not reach ElevenLabs: {e}",
+        }
+
+    if response.status_code >= 400:
+        return {
+            "success": False,
+            "audio": b"",
+            "mime_type": "",
+            "sample_rate": 0,
+            "message": (
+                f"ElevenLabs TTS failed "
+                f"({response.status_code}): "
+                f"{response.text[:300]}"
+            ),
+        }
 
     return {
-        "success": False,
-        "audio": b"",
-        "mime_type": "",
-        "sample_rate": 0,
-        "message": f"TTS language not supported: {language}",
+        "success": True,
+        "audio": response.content,
+        "mime_type": "application/octet-stream",
+        "sample_rate": 16000,
+        "message": "ok",
     }
 
 def _transcribe_audio(
@@ -1279,16 +1213,10 @@ def _transcribe_audio(
     spoken_language: str,
     reference_examples: Optional[list[dict]] = None,
 ) -> str:
-    """
-    Transcribe audio using Gemini 3.5 Transcribe.
-
-    Pronunciation-training transcripts are converted into custom vocabulary
-    hints for names/terms that Gemini should recognize more reliably.
-    """
 
     client = get_client()
 
-    # Build vocabulary hints from your pronunciation-training transcripts.
+    # Build vocabulary hints from pronunciation-training transcripts.
     vocabulary = []
 
     if reference_examples:
@@ -1296,10 +1224,8 @@ def _transcribe_audio(
             transcript = (example.get("transcript") or "").strip()
 
             if transcript:
-                # Include full phrase.
                 vocabulary.append(transcript)
 
-                # Also include individual words.
                 for word in transcript.split():
                     word = word.strip(".,!?;:\"'()[]{}")
 
@@ -1309,10 +1235,10 @@ def _transcribe_audio(
     # Remove duplicates while preserving order.
     vocabulary = list(dict.fromkeys(vocabulary))
 
-    # Keep this relatively small.
+    # Keep the vocabulary focused.
     vocabulary = vocabulary[:100]
 
-    # Upload the WAV/audio file to Gemini.
+    # Upload the recorded audio to Gemini.
     audio_file = client.files.upload(
         file=file_path
     )
@@ -1340,12 +1266,16 @@ def _transcribe_audio(
 
     return (interaction.output_text or "").strip()
 
+
 def transcribe_audio(
     file_path: str,
     mime_type: str,
     language: str,
 ) -> str:
-    reference_examples = _load_audio_examples(language)
+
+    reference_examples = _load_audio_examples(
+        language
+    )
 
     return _transcribe_audio(
         file_path,
