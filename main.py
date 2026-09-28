@@ -89,12 +89,74 @@ def _require_device_auth(
             "Invalid device authorization"
         )
 
+@app.post("/api/device/register")
+def register_device(
+    body: DeviceRegisterRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    _require_device_auth(authorization)
+
+    device = agent.db_register_device(
+        body.device_id.strip(),
+        body.mac_address.strip(),
+        body.firmware_version.strip() or "unknown",
+    )
+
+    return {
+        "success": True,
+        "device": device,
+    }
+
+
+@app.post("/api/device/heartbeat")
+def device_heartbeat(
+    body: DeviceHeartbeatRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    _require_device_auth(authorization)
+
+    device = agent.db_heartbeat_device(
+        device_id=body.device_id.strip(),
+        mac_address=body.mac_address.strip(),
+        firmware_version=body.firmware_version.strip() or "unknown",
+        wifi_rssi=body.wifi_rssi,
+        battery_percent=body.battery_percent,
+    )
+
+    return {
+        "success": True,
+        "device": device,
+    }
+
+
+@app.get("/api/devices")
+def list_devices(
+    authorization: Optional[str] = Header(default=None),
+):
+    _require_device_auth(authorization)
+
+    return {
+        "devices": agent.db_list_devices()
+    }
+    
 class TranslateRequest(BaseModel):
     text: str
     language: str
     target_language: Optional[str] = None
     direction: str = "to_english"  # legacy: "to_english" or "from_english"
 
+class DeviceRegisterRequest(BaseModel):
+    device_id: str
+    mac_address: str
+    firmware_version: str = "unknown"
+
+
+class DeviceHeartbeatRequest(BaseModel):
+    device_id: str
+    mac_address: str = ""
+    firmware_version: str = "unknown"
+    wifi_rssi: Optional[int] = None
+    battery_percent: Optional[int] = None
 
 @app.get("/health")
 def health():
