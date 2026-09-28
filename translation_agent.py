@@ -25,6 +25,7 @@ import json
 import tempfile
 from pathlib import Path
 from typing import Optional
+import time
 
 import numpy as np
 import pandas as pd
@@ -765,22 +766,52 @@ def translate_text(
     user_prompt = f"Translate this text from {source_language} into {target_language}:\n\n{text}"
 
     client = get_client()
-    response = client.models.generate_content(
-        model=CHAT_MODEL,
-        contents=user_prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=0.2,
-        ),
-    )
 
-    translation = response.text.strip()
-
-    return {
-        "translation": translation,
-        "examples_used": len(examples),
-        "trained": trained,
-    }
+    last_error = None
+    
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model=CHAT_MODEL,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.2,
+                ),
+            )
+    
+            translation = response.text.strip()
+    
+            return {
+                "translation": translation,
+                "examples_used": len(examples),
+                "trained": trained,
+            }
+    
+        except Exception as e:
+            last_error = e
+            message = str(e)
+    
+            temporary_error = (
+                "503" in message
+                or "UNAVAILABLE" in message
+                or "high demand" in message.lower()
+            )
+    
+            if not temporary_error:
+                raise
+    
+            if attempt < 2:
+                delay_seconds = 1.5 * (attempt + 1)
+    
+                print(
+                    f"Gemini temporarily unavailable. "
+                    f"Retrying in {delay_seconds:.1f}s..."
+                )
+    
+                time.sleep(delay_seconds)
+    
+    raise last_error
 
 
 # ---------------------------------------------------------------------
