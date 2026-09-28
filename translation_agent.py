@@ -1318,3 +1318,186 @@ def transcribe_and_translate_audio(
         "trained": result["trained"],
         "pronunciation_samples_used": len(reference_examples),
         }
+
+# ---------------------------------------------------------------------
+# SALINGO physical devices
+# ---------------------------------------------------------------------
+
+def _device_row_to_dict(row) -> dict:
+    return {
+        "device_id": row[0],
+        "mac_address": row[1],
+        "device_name": row[2],
+        "firmware_version": row[3],
+        "wifi_rssi": row[4],
+        "battery_percent": row[5],
+        "registered_at": row[6].isoformat() if row[6] else None,
+        "last_seen": row[7].isoformat() if row[7] else None,
+    }
+
+
+def db_register_device(
+    device_id: str,
+    mac_address: str,
+    firmware_version: str,
+) -> dict:
+
+    conn = _get_db_connection()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO devices
+                    (
+                        device_id,
+                        mac_address,
+                        firmware_version,
+                        registered_at,
+                        last_seen
+                    )
+                VALUES
+                    (%s, %s, %s, NOW(), NOW())
+
+                ON CONFLICT (device_id)
+
+                DO UPDATE SET
+                    mac_address = EXCLUDED.mac_address,
+                    firmware_version = EXCLUDED.firmware_version,
+                    last_seen = NOW()
+
+                RETURNING
+                    device_id,
+                    mac_address,
+                    device_name,
+                    firmware_version,
+                    wifi_rssi,
+                    battery_percent,
+                    registered_at,
+                    last_seen
+                """,
+                (
+                    device_id,
+                    mac_address,
+                    firmware_version,
+                ),
+            )
+
+            row = cur.fetchone()
+            conn.commit()
+
+    finally:
+        conn.close()
+
+    return _device_row_to_dict(row)
+
+
+def db_heartbeat_device(
+    device_id: str,
+    mac_address: str = "",
+    firmware_version: str = "unknown",
+    wifi_rssi: Optional[int] = None,
+    battery_percent: Optional[int] = None,
+) -> dict:
+
+    conn = _get_db_connection()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO devices
+                    (
+                        device_id,
+                        mac_address,
+                        firmware_version,
+                        wifi_rssi,
+                        battery_percent,
+                        registered_at,
+                        last_seen
+                    )
+                VALUES
+                    (%s, %s, %s, %s, %s, NOW(), NOW())
+
+                ON CONFLICT (device_id)
+
+                DO UPDATE SET
+                    mac_address =
+                        CASE
+                            WHEN EXCLUDED.mac_address <> ''
+                            THEN EXCLUDED.mac_address
+                            ELSE devices.mac_address
+                        END,
+
+                    firmware_version =
+                        EXCLUDED.firmware_version,
+
+                    wifi_rssi =
+                        EXCLUDED.wifi_rssi,
+
+                    battery_percent =
+                        EXCLUDED.battery_percent,
+
+                    last_seen = NOW()
+
+                RETURNING
+                    device_id,
+                    mac_address,
+                    device_name,
+                    firmware_version,
+                    wifi_rssi,
+                    battery_percent,
+                    registered_at,
+                    last_seen
+                """,
+                (
+                    device_id,
+                    mac_address,
+                    firmware_version,
+                    wifi_rssi,
+                    battery_percent,
+                ),
+            )
+
+            row = cur.fetchone()
+            conn.commit()
+
+    finally:
+        conn.close()
+
+    return _device_row_to_dict(row)
+
+
+def db_list_devices() -> list[dict]:
+
+    conn = _get_db_connection()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    device_id,
+                    mac_address,
+                    device_name,
+                    firmware_version,
+                    wifi_rssi,
+                    battery_percent,
+                    registered_at,
+                    last_seen
+
+                FROM devices
+
+                ORDER BY last_seen DESC
+                """
+            )
+
+            rows = cur.fetchall()
+
+    finally:
+        conn.close()
+
+    return [
+        _device_row_to_dict(row)
+        for row in rows
+    ]
