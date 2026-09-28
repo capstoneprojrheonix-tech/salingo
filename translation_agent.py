@@ -174,7 +174,7 @@ def db_list_language_records() -> list[dict]:
     ]
 
 EMBEDDING_MODEL = "gemini-embedding-001"
-CHAT_MODEL = "gemini-3.5-flash"
+CHAT_MODEL = "gemini-3.5-flash-lite"
 EMBEDDING_BATCH_SIZE = 100
 MAX_AUDIO_EXAMPLES_PER_REQUEST = 5  # how many reference clips to feed Gemini per transcription
 MAX_AUDIO_SAMPLE_BYTES = 5 * 1024 * 1024  # 5 MB cap per training clip
@@ -733,84 +733,133 @@ def translate_text(
     target_language: str = "English",
     k: int = 4,
 ) -> dict:
-    """
-    Translate `text` from `source_language` into `target_language`.
-    Works for ANY language pair (e.g. Kapampangan -> Tagalog), not just
-    a fixed "-> English" direction.
-    """
+
     examples: list[dict] = []
-    trained = language_pair_is_trained(source_language, target_language)
+
+    trained = language_pair_is_trained(
+        source_language,
+        target_language
+    )
 
     if trained:
-        embeddings, metadata = _load_pair_from_db(source_language, target_language)
+        embeddings, metadata = _load_pair_from_db(
+            source_language,
+            target_language
+        )
+
         direction_indices = [
             i for i, m in enumerate(metadata)
-            if m["source_lang"].strip().lower() == source_language.strip().lower()
-            and m["target_lang"].strip().lower() == target_language.strip().lower()
+            if m["source_lang"].strip().lower()
+            == source_language.strip().lower()
+            and m["target_lang"].strip().lower()
+            == target_language.strip().lower()
         ]
 
         if direction_indices:
-            sub_matrix = embeddings[direction_indices]
-            query_vec = _embed_texts([text])[0]
-            top_local = _cosine_top_k(query_vec, sub_matrix, k)
-            examples = [metadata[direction_indices[i]] for i in top_local]
+            sub_matrix = embeddings[
+                direction_indices
+            ]
+
+            query_vec = _embed_texts(
+                [text]
+            )[0]
+
+            top_local = _cosine_top_k(
+                query_vec,
+                sub_matrix,
+                k
+            )
+
+            examples = [
+                metadata[direction_indices[i]]
+                for i in top_local
+            ]
 
     system_prompt = (
-        f"You are a professional translator working from '{source_language}' into "
-        f"'{target_language}'. Use the example translations below (retrieved from a "
-        "verified translation memory) to match terminology, tone, and phrasing. If no "
-        "examples are relevant, translate using your own knowledge of both languages. "
-        "Respond with ONLY the translated text â€” no explanations, no quotes, no extra "
-        "commentary.\n\nExamples:\n" + _format_examples(examples)
+        f"You are a professional translator working from "
+        f"'{source_language}' into '{target_language}'. "
+        f"Translate naturally and accurately. "
+
+        "Use the supplied translation examples only when "
+        "they are relevant to the input. "
+
+        "Preserve the intended meaning instead of translating "
+        "word-for-word when that would sound unnatural. "
+
+        "Respond with ONLY the translated text. "
+        "Do not explain the translation. "
+        "Do not add quotation marks. "
+        "Do not add commentary.\n\n"
+
+        "Examples:\n"
+        + _format_examples(examples)
     )
-    user_prompt = f"Translate this text from {source_language} into {target_language}:\n\n{text}"
+
+    user_prompt = (
+        f"Translate from {source_language} "
+        f"to {target_language}:\n\n"
+        f"{text}"
+    )
 
     client = get_client()
 
     last_error = None
-    
-    for attempt in range(3):
+
+    # Fast mode:
+    # First attempt immediately.
+    # Only one quick retry when Gemini is temporarily busy.
+    for attempt in range(2):
+
         try:
+
             response = client.models.generate_content(
                 model=CHAT_MODEL,
                 contents=user_prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    temperature=0.2,
+                    temperature=0.1,
                 ),
             )
-    
-            translation = response.text.strip()
-    
+
+            translation = (
+                response.text or ""
+            ).strip()
+
+            if not translation:
+                raise RuntimeError(
+                    "Gemini returned an empty translation."
+                )
+
             return {
                 "translation": translation,
                 "examples_used": len(examples),
                 "trained": trained,
             }
-    
+
         except Exception as e:
+
             last_error = e
             message = str(e)
-    
+
             temporary_error = (
                 "503" in message
                 or "UNAVAILABLE" in message
                 or "high demand" in message.lower()
+                or "429" in message
+                or "RESOURCE_EXHAUSTED" in message
             )
-    
+
             if not temporary_error:
                 raise
-    
-            if attempt < 2:
-                delay_seconds = 1.5 * (attempt + 1)
-    
+
+            if attempt == 0:
                 print(
-                    f"Gemini temporarily unavailable. "
-                    f"Retrying in {delay_seconds:.1f}s..."
+                    "Gemini busy. "
+                    "Quick retry in 0.75 seconds..."
                 )
-    
-                time.sleep(delay_seconds)
-    
+
+                time.sleep(0.75)
+
     raise last_error
 
 
@@ -1247,23 +1296,25 @@ def _transcribe_audio(
 
     client = get_client()
 
-    # -------------------------------------------------------------
-    # Language hint
-    # -------------------------------------------------------------
-
-    language_key = (spoken_language or "").strip().lower()
+    language_key = (
+        spoken_language or ""
+    ).strip().lower()
 
     language_codes = []
 
-    if language_key in ("tagalog", "filipino"):
-        language_codes = ["fil-PH"]
+    if language_key in (
+        "tagalog",
+        "filipino",
+    ):
+        language_codes = [
+            "fil-PH"
+        ]
 
     elif language_key == "english":
-        language_codes = ["en-US"]
+        language_codes = [
+            "en-US"
+        ]
 
-    # Gemini 3.5 Transcribe does not currently list Kapampangan as a
-    # directly supported BCP-47 transcription language.
-    # Leave it empty so Gemini can automatically detect it.
     elif language_key in (
         "kapampangan",
         "pampanga",
@@ -1271,26 +1322,25 @@ def _transcribe_audio(
     ):
         language_codes = []
 
-    # -------------------------------------------------------------
-    # Build vocabulary hints from pronunciation-training transcripts
-    # -------------------------------------------------------------
-
     vocabulary = []
 
     if reference_examples:
+
         for example in reference_examples:
 
             transcript = (
-                example.get("transcript") or ""
+                example.get(
+                    "transcript"
+                ) or ""
             ).strip()
 
             if not transcript:
                 continue
 
-            # Add complete phrase.
-            vocabulary.append(transcript)
+            vocabulary.append(
+                transcript
+            )
 
-            # Add individual words.
             for word in transcript.split():
 
                 word = word.strip(
@@ -1298,64 +1348,58 @@ def _transcribe_audio(
                 )
 
                 if len(word) >= 2:
-                    vocabulary.append(word)
+                    vocabulary.append(
+                        word
+                    )
 
-    # Remove duplicates while preserving order.
     vocabulary = list(
         dict.fromkeys(vocabulary)
     )
 
-    # Keep vocabulary focused.
     vocabulary = vocabulary[:100]
-
-    # -------------------------------------------------------------
-    # Upload recorded WAV/audio
-    # -------------------------------------------------------------
 
     audio_file = client.files.upload(
         file=file_path
     )
-
-    # -------------------------------------------------------------
-    # Gemini transcription configuration
-    # -------------------------------------------------------------
-
+    
     transcription_config = {
-        "mode": "verbatim",
+        "mode": "verbatim"
     }
 
-    # Tell Gemini what language the user selected.
     if language_codes:
         transcription_config[
             "language_codes"
         ] = language_codes
 
-    # Add trained pronunciation vocabulary.
     if vocabulary:
         transcription_config[
             "custom_vocabulary"
         ] = vocabulary
 
     print(
-        f"STT language: {spoken_language} "
-        f"-> {language_codes or 'auto'}"
+        f"STT language: "
+        f"{spoken_language} -> "
+        f"{language_codes or 'auto'}"
     )
 
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
     # Transcribe
-    # -------------------------------------------------------------
+    # ---------------------------------------------------------
 
     interaction = client.interactions.create(
+
         model="gemini-3.5-transcribe",
 
         input=[
             {
                 "type": "audio",
-                "uri": audio_file.uri,
-                "mime_type": (
+
+                "uri":
+                    audio_file.uri,
+
+                "mime_type":
                     audio_file.mime_type
-                    or mime_type
-                ),
+                    or mime_type,
             }
         ],
 
@@ -1370,7 +1414,8 @@ def _transcribe_audio(
     ).strip()
 
     print(
-        f"STT transcript: {transcript}"
+        f"STT transcript: "
+        f"{transcript}"
     )
 
     return transcript
