@@ -20,12 +20,22 @@ Backward compatibility notes:
     to translate/train between ANY two languages, e.g. Kapampangan <-> Tagalog.
 """
 
+import os
+import hmac
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    Form,
+    HTTPException,
+    Response,
+    Header,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -40,6 +50,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------------------------------------------------------------
+# SALINGO physical device authentication
+# ---------------------------------------------------------------------
+
+SALINGO_DEVICE_SECRET = os.getenv(
+    "SALINGO_DEVICE_SECRET",
+    ""
+).strip()
+
+
+def _require_device_auth(
+    authorization: Optional[str]
+) -> None:
+
+    if not SALINGO_DEVICE_SECRET:
+        raise HTTPException(
+            503,
+            "SALINGO_DEVICE_SECRET is not configured on the server"
+        )
+
+    prefix = "Bearer "
+
+    if not authorization or not authorization.startswith(prefix):
+        raise HTTPException(
+            401,
+            "Missing device authorization"
+        )
+
+    supplied = authorization[len(prefix):].strip()
+
+    if not hmac.compare_digest(
+        supplied,
+        SALINGO_DEVICE_SECRET
+    ):
+        raise HTTPException(
+            401,
+            "Invalid device authorization"
+        )
 
 class TranslateRequest(BaseModel):
     text: str
@@ -107,6 +155,57 @@ def train(
 
     return result
 
+# ---------------------------------------------------------------------
+# ESP32 speech-to-text
+# ---------------------------------------------------------------------
+
+@app.post("/api/device/transcribe")
+def device_transcribe(
+    language: str = Form(...),
+    audio: UploadFile = File(...),
+    authorization: Optional[str] = Header(default=None),
+):
+    _require_device_auth(authorization)
+
+    mime_type = audio.content_type or "audio/wav"
+
+    tmp_dir = Path(tempfile.mkdtemp())
+
+    tmp_path = tmp_dir / (
+        audio.filename or "recording.wav"
+    )
+
+    try:
+        # Save the WAV uploaded by the ESP32.
+        with open(tmp_path, "wb") as f:
+            shutil.copyfileobj(
+                audio.file,
+                f
+            )
+
+        try:
+            transcript = agent.transcribe_audio(
+                str(tmp_path),
+                mime_type,
+                language,
+            )
+
+        except Exception as e:
+            raise HTTPException(
+                500,
+                f"Transcription failed: {e}"
+            )
+
+    finally:
+        shutil.rmtree(
+            tmp_dir,
+            ignore_errors=True
+        )
+
+    return {
+        "success": True,
+        "transcript": transcript,
+    }
 
 @app.post("/translate-audio")
 def translate_audio(
