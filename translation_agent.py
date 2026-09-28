@@ -1280,53 +1280,79 @@ def _transcribe_audio(
     reference_examples: Optional[list[dict]] = None,
 ) -> str:
     """
-    Transcribe a short audio clip using Gemini's audio understanding.
-    Works for any language the model has been told to expect, including
-    languages with no dedicated browser speech-recognition support
-    (e.g. Kapampangan).
+    Transcribe audio using Gemini 3.5 Transcribe.
 
-    If `reference_examples` is provided (each a dict with "data",
-    "mime_type", "transcript"), they're fed to Gemini first as few-shot
-    reference recordings â€” trained pronunciation samples for this
-    language â€” to calibrate its understanding of accent, pronunciation,
-    and spelling before it transcribes the real clip.
+    Pronunciation-training transcripts are converted into custom vocabulary
+    hints for names/terms that Gemini should recognize more reliably.
     """
-    with open(file_path, "rb") as f:
-        audio_bytes = f.read()
-
-    contents: list = [
-        f"You are an expert speech transcriber for the '{spoken_language}' language, "
-        "including regional accents and non-standard spellings."
-    ]
-
-    if reference_examples:
-        contents.append(
-            "Here are reference recordings from a trained speaker in this language, each "
-            "followed by its correct transcript. Use these ONLY to calibrate your "
-            "understanding of pronunciation and spelling conventions â€” do NOT transcribe "
-            "these reference clips themselves."
-        )
-        for example in reference_examples:
-            contents.append(types.Part.from_bytes(data=example["data"], mime_type=example["mime_type"]))
-            contents.append(f"Reference transcript: {example['transcript']}")
-
-    contents.append(
-        f"Now transcribe ONLY the following new audio clip. Respond with ONLY the "
-        f"verbatim transcript in '{spoken_language}' â€” no explanations, no quotes, no "
-        "extra commentary. If the audio is silent or unintelligible, respond with an "
-        "empty string."
-    )
-    contents.append(types.Part.from_bytes(data=audio_bytes, mime_type=mime_type))
 
     client = get_client()
-    response = client.models.generate_content(
-        model=CHAT_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(temperature=0.0),
+
+    # Build vocabulary hints from your pronunciation-training transcripts.
+    vocabulary = []
+
+    if reference_examples:
+        for example in reference_examples:
+            transcript = (example.get("transcript") or "").strip()
+
+            if transcript:
+                # Include full phrase.
+                vocabulary.append(transcript)
+
+                # Also include individual words.
+                for word in transcript.split():
+                    word = word.strip(".,!?;:\"'()[]{}")
+
+                    if len(word) >= 2:
+                        vocabulary.append(word)
+
+    # Remove duplicates while preserving order.
+    vocabulary = list(dict.fromkeys(vocabulary))
+
+    # Keep this relatively small.
+    vocabulary = vocabulary[:100]
+
+    # Upload the WAV/audio file to Gemini.
+    audio_file = client.files.upload(
+        file=file_path
     )
 
-    return (response.text or "").strip()
+    transcription_config = {
+        "mode": "verbatim",
+    }
 
+    if vocabulary:
+        transcription_config["custom_vocabulary"] = vocabulary
+
+    interaction = client.interactions.create(
+        model="gemini-3.5-transcribe",
+        input=[
+            {
+                "type": "audio",
+                "uri": audio_file.uri,
+                "mime_type": audio_file.mime_type or mime_type,
+            }
+        ],
+        generation_config={
+            "transcription_config": transcription_config
+        },
+    )
+
+    return (interaction.output_text or "").strip()
+
+def transcribe_audio(
+    file_path: str,
+    mime_type: str,
+    language: str,
+) -> str:
+    reference_examples = _load_audio_examples(language)
+
+    return _transcribe_audio(
+        file_path,
+        mime_type,
+        language,
+        reference_examples,
+    )
 
 def transcribe_and_translate_audio(
     file_path: str,
