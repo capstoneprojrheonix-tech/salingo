@@ -9,3 +9,7 @@ numpy
 python-dotenv
 psycopg2-binary
 requests
+
+torch
+transformers>=4.33
+accelerate
