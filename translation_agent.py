@@ -1247,56 +1247,133 @@ def _transcribe_audio(
 
     client = get_client()
 
-    # Build vocabulary hints from pronunciation-training transcripts.
+    # -------------------------------------------------------------
+    # Language hint
+    # -------------------------------------------------------------
+
+    language_key = (spoken_language or "").strip().lower()
+
+    language_codes = []
+
+    if language_key in ("tagalog", "filipino"):
+        language_codes = ["fil-PH"]
+
+    elif language_key == "english":
+        language_codes = ["en-US"]
+
+    # Gemini 3.5 Transcribe does not currently list Kapampangan as a
+    # directly supported BCP-47 transcription language.
+    # Leave it empty so Gemini can automatically detect it.
+    elif language_key in (
+        "kapampangan",
+        "pampanga",
+        "pampangan",
+    ):
+        language_codes = []
+
+    # -------------------------------------------------------------
+    # Build vocabulary hints from pronunciation-training transcripts
+    # -------------------------------------------------------------
+
     vocabulary = []
 
     if reference_examples:
         for example in reference_examples:
-            transcript = (example.get("transcript") or "").strip()
 
-            if transcript:
-                vocabulary.append(transcript)
+            transcript = (
+                example.get("transcript") or ""
+            ).strip()
 
-                for word in transcript.split():
-                    word = word.strip(".,!?;:\"'()[]{}")
+            if not transcript:
+                continue
 
-                    if len(word) >= 2:
-                        vocabulary.append(word)
+            # Add complete phrase.
+            vocabulary.append(transcript)
+
+            # Add individual words.
+            for word in transcript.split():
+
+                word = word.strip(
+                    ".,!?;:\"'()[]{}"
+                )
+
+                if len(word) >= 2:
+                    vocabulary.append(word)
 
     # Remove duplicates while preserving order.
-    vocabulary = list(dict.fromkeys(vocabulary))
+    vocabulary = list(
+        dict.fromkeys(vocabulary)
+    )
 
-    # Keep the vocabulary focused.
+    # Keep vocabulary focused.
     vocabulary = vocabulary[:100]
 
-    # Upload the recorded audio to Gemini.
+    # -------------------------------------------------------------
+    # Upload recorded WAV/audio
+    # -------------------------------------------------------------
+
     audio_file = client.files.upload(
         file=file_path
     )
+
+    # -------------------------------------------------------------
+    # Gemini transcription configuration
+    # -------------------------------------------------------------
 
     transcription_config = {
         "mode": "verbatim",
     }
 
+    # Tell Gemini what language the user selected.
+    if language_codes:
+        transcription_config[
+            "language_codes"
+        ] = language_codes
+
+    # Add trained pronunciation vocabulary.
     if vocabulary:
-        transcription_config["custom_vocabulary"] = vocabulary
+        transcription_config[
+            "custom_vocabulary"
+        ] = vocabulary
+
+    print(
+        f"STT language: {spoken_language} "
+        f"-> {language_codes or 'auto'}"
+    )
+
+    # -------------------------------------------------------------
+    # Transcribe
+    # -------------------------------------------------------------
 
     interaction = client.interactions.create(
         model="gemini-3.5-transcribe",
+
         input=[
             {
                 "type": "audio",
                 "uri": audio_file.uri,
-                "mime_type": audio_file.mime_type or mime_type,
+                "mime_type": (
+                    audio_file.mime_type
+                    or mime_type
+                ),
             }
         ],
+
         generation_config={
-            "transcription_config": transcription_config
+            "transcription_config":
+                transcription_config
         },
     )
 
-    return (interaction.output_text or "").strip()
+    transcript = (
+        interaction.output_text or ""
+    ).strip()
 
+    print(
+        f"STT transcript: {transcript}"
+    )
+
+    return transcript
 
 def transcribe_audio(
     file_path: str,
