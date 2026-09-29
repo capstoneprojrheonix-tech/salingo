@@ -810,13 +810,19 @@ def translate_text(
                 contents=user_prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
-                    temperature=0.1,
+                    temperature=0.0,
                 ),
             )
 
             translation = (
                 response.text or ""
             ).strip()
+
+            if " / " in translation:
+                translation = translation.split(" / ", 1)[0].strip()
+
+            if " | " in translation:
+                translation = translation.split(" | ", 1)[0].strip()
 
             if not translation:
                 raise RuntimeError(
