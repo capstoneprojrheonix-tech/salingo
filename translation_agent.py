@@ -776,23 +776,16 @@ def translate_text(
             ]
 
     system_prompt = (
-        f"You are a professional translator working from "
-        f"'{source_language}' into '{target_language}'. "
-        f"Translate naturally and accurately. "
-
-        "Use the supplied translation examples only when "
-        "they are relevant to the input. "
-
-        "Preserve the intended meaning instead of translating "
-        "word-for-word when that would sound unnatural. "
-
-        "Respond with ONLY the translated text. "
-        "Do not explain the translation. "
-        "Do not add quotation marks. "
-        "Do not add commentary.\n\n"
-
-        "Examples:\n"
-        + _format_examples(examples)
+        f"You are a professional translator working from '{source_language}' into '{target_language}'. "
+        "Use the example translations below only when they are relevant. "
+        "Return exactly ONE best translation. "
+        "Never provide alternative translations. "
+        "Never separate answers using '/', '|', 'or', parentheses, or multiple versions. "
+        "Do not repeat the translation. "
+        "Do not explain anything. "
+        "Do not use quotation marks. "
+        "Respond with only the final translated phrase or sentence.\n\n"
+        "Examples:\n" + _format_examples(examples)
     )
 
     user_prompt = (
