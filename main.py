@@ -283,6 +283,22 @@ def list_devices(
         "devices": devices
     }
 
+def _version_tuple(version: str):
+    clean = version.strip().lstrip("vV")
+    parts = clean.split(".")
+    values = []
+
+    for part in parts:
+        try:
+            values.append(int(part))
+        except ValueError:
+            values.append(0)
+
+    while len(values) < 4:
+        values.append(0)
+
+    return tuple(values[:4])
+    
 @app.get("/api/firmware/latest")
 def latest_firmware(
     current_version: str = "",
@@ -851,19 +867,3 @@ def update_language_record(
     return {
         "success": True
     }
-
-def _version_tuple(version: str):
-    clean = version.strip().lstrip("vV")
-    parts = clean.split(".")
-    values = []
-
-    for part in parts:
-        try:
-            values.append(int(part))
-        except ValueError:
-            values.append(0)
-
-    while len(values) < 4:
-        values.append(0)
-
-    return tuple(values[:4])
