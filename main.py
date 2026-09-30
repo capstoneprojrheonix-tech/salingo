@@ -283,6 +283,30 @@ def list_devices(
         "devices": devices
     }
 
+@app.get("/api/firmware/latest")
+def latest_firmware(
+    current_version: str = "",
+    authorization: Optional[str] = Header(default=None),
+):
+    _require_device_auth(authorization)
+
+    firmware = _get_latest_firmware()
+
+    if firmware is None:
+        raise HTTPException(404, "No firmware release is available")
+
+    installed = current_version.strip().lstrip("vV")
+    latest = str(firmware.get("VersionCode") or "").strip().lstrip("vV")
+
+    return {
+        "success": True,
+        "update_available": bool(latest and installed != latest),
+        "current_version": installed,
+        "latest_version": latest,
+        "update_info": str(firmware.get("UpdateInfo") or ""),
+        "firmware_url": str(firmware.get("FirmwareUrl") or ""),
+        "sha256": str(firmware.get("FirmwareSha256") or ""),
+    }
 
 # ============================================================
 # ESP32 speech-to-text
