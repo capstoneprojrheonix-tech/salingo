@@ -84,6 +84,12 @@ class DeviceHeartbeatRequest(BaseModel):
     battery_percent: Optional[int] = None
 
 
+class DeviceReportRequest(BaseModel):
+    device_id: str
+    category: str
+    message: str
+
+
 class LanguageRecordUpdate(BaseModel):
     language_name: str
     status: str
@@ -137,6 +143,41 @@ def _require_device_auth(
             401,
             "Invalid device authorization"
         )
+
+def _supabase_request(method: str, table: str, query: str = "", body=None):
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise HTTPException(503, "Supabase service is not configured")
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{table}"
+    if query:
+        url += f"?{query}"
+
+    data = None
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        "Accept": "application/json",
+    }
+
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+        headers["Prefer"] = "return=representation"
+
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers=headers,
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response_text = response.read().decode("utf-8")
+            return json.loads(response_text) if response_text else None
+    except Exception as e:
+        raise HTTPException(502, f"Supabase request failed: {e}")
+
 
 def _get_latest_firmware():
     if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
@@ -283,6 +324,43 @@ def list_devices(
     return {
         "devices": devices
     }
+
+@app.post("/api/device/reports")
+def create_device_report(
+    body: DeviceReportRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
+):
+    _require_device_auth(credentials)
+
+    device_id = body.device_id.strip()
+    category = body.category.strip()
+    message = body.message.strip()
+
+    if not device_id:
+        raise HTTPException(400, "device_id is required")
+
+    if not category:
+        raise HTTPException(400, "category is required")
+
+    if not message:
+        raise HTTPException(400, "message is required")
+
+    rows = _supabase_request(
+        "POST",
+        "deviceReports",
+        body={
+            "DeviceID": device_id,
+            "Category": category,
+            "Message": message,
+            "Status": "Pending",
+        },
+    )
+
+    return {
+        "success": True,
+        "report": rows[0] if rows else None,
+    }
+
 
 def _version_tuple(version: str):
     clean = version.strip().lstrip("vV")
