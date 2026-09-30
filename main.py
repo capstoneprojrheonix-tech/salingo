@@ -99,6 +99,8 @@ SALINGO_DEVICE_SECRET = os.getenv(
     ""
 ).strip()
 
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
 
 def _require_device_auth(
     authorization: Optional[str]
@@ -132,6 +134,38 @@ def _require_device_auth(
             "Invalid device authorization"
         )
 
+def _get_latest_firmware():
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise HTTPException(503, "Supabase firmware service is not configured")
+
+    query = urllib.parse.urlencode({
+        "select": "ID,VersionCode,Status,UpdateInfo,FirmwareUrl,FirmwareSha256",
+        "Status": "eq.Latest",
+        "order": "ID.desc",
+        "limit": "1",
+    })
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/updateManagement?{query}"
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "apikey": SUPABASE_SECRET_KEY,
+            "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            rows = json.loads(response.read().decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(502, f"Could not read firmware information: {e}")
+
+    if not rows:
+        return None
+
+    return rows[0]
 
 # ============================================================
 # Health
