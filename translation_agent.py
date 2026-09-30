@@ -731,7 +731,7 @@ def translate_text(
     text: str,
     source_language: str,
     target_language: str = "English",
-    k: int = 4,
+    k: int = 8,
 ) -> dict:
 
     examples: list[dict] = []
@@ -776,16 +776,18 @@ def translate_text(
             ]
 
     system_prompt = (
-        f"You are a professional translator working from '{source_language}' into '{target_language}'. "
-        "Use the example translations below only when they are relevant. "
-        "Return exactly ONE best translation. "
-        "Never provide alternative translations. "
-        "Never separate answers using '/', '|', 'or', parentheses, or multiple versions. "
-        "Do not repeat the translation. "
-        "Do not explain anything. "
-        "Do not use quotation marks. "
-        "Respond with only the final translated phrase or sentence.\n\n"
-        "Examples:\n" + _format_examples(examples)
+        f"You are translating from '{source_language}' into '{target_language}'. "
+        "The provided translation examples are human-verified SALINGO reference data. "
+        "When translating Kapampangan, treat relevant reference examples as the primary "
+        "authority for vocabulary, spelling, and grammatical patterns. "
+        "Do not invent Kapampangan words. "
+        "Do not create Kapampangan-looking words by modifying Tagalog or English words. "
+        "When a reference example closely matches the meaning of the input, preserve its "
+        "established vocabulary and grammatical pattern. "
+        "If no reference is relevant, produce the most conservative natural translation "
+        "you can rather than inventing unfamiliar vocabulary. "
+        "Return exactly one translation and nothing else.\n\n"
+        "Human-verified examples:\n" + _format_examples(examples)
     )
 
     user_prompt = (
