@@ -32,9 +32,10 @@ from fastapi import (
     Form,
     HTTPException,
     Response,
-    Header,
+    Depends,
 )
 
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -94,6 +95,8 @@ class LanguageRecordUpdate(BaseModel):
 # SALINGO physical device authentication
 # ============================================================
 
+device_security = HTTPBearer(auto_error=False)
+
 SALINGO_DEVICE_SECRET = os.getenv(
     "SALINGO_DEVICE_SECRET",
     ""
@@ -103,7 +106,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY", "").strip()
 
 def _require_device_auth(
-    authorization: Optional[str]
+    credentials: Optional[HTTPAuthorizationCredentials]
 ) -> None:
 
     if not SALINGO_DEVICE_SECRET:
@@ -112,18 +115,19 @@ def _require_device_auth(
             "SALINGO_DEVICE_SECRET is not configured on the server"
         )
 
-    prefix = "Bearer "
-
-    if (
-        not authorization
-        or not authorization.startswith(prefix)
-    ):
+    if credentials is None:
         raise HTTPException(
             401,
             "Missing device authorization"
         )
 
-    supplied = authorization[len(prefix):].strip()
+    if credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            401,
+            "Invalid authorization scheme"
+        )
+
+    supplied = credentials.credentials.strip()
 
     if not hmac.compare_digest(
         supplied,
@@ -185,11 +189,9 @@ def health():
 @app.post("/api/device/register")
 def register_device(
     body: DeviceRegisterRequest,
-    authorization: Optional[str] = Header(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
 ):
-    _require_device_auth(
-        authorization
-    )
+    _require_device_auth(credentials)
 
     if not body.device_id.strip():
         raise HTTPException(
@@ -226,11 +228,9 @@ def register_device(
 @app.post("/api/device/heartbeat")
 def device_heartbeat(
     body: DeviceHeartbeatRequest,
-    authorization: Optional[str] = Header(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
 ):
-    _require_device_auth(
-        authorization
-    )
+    _require_device_auth(credentials)
 
     if not body.device_id.strip():
         raise HTTPException(
@@ -264,11 +264,9 @@ def device_heartbeat(
 
 @app.get("/api/devices")
 def list_devices(
-    authorization: Optional[str] = Header(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
 ):
-    _require_device_auth(
-        authorization
-    )
+    _require_device_auth(credentials)
 
     try:
         devices = agent.db_list_devices()
@@ -298,13 +296,13 @@ def _version_tuple(version: str):
         values.append(0)
 
     return tuple(values[:4])
-    
+
 @app.get("/api/firmware/latest")
 def latest_firmware(
     current_version: str = "",
-    authorization: Optional[str] = Header(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
 ):
-    _require_device_auth(authorization)
+    _require_device_auth(credentials)
 
     firmware = _get_latest_firmware()
 
@@ -332,11 +330,9 @@ def latest_firmware(
 def device_transcribe(
     language: str = Form(...),
     audio: UploadFile = File(...),
-    authorization: Optional[str] = Header(default=None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
 ):
-    _require_device_auth(
-        authorization
-    )
+    _require_device_auth(credentials)
 
     mime_type = (
         audio.content_type
