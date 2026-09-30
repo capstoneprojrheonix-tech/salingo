@@ -300,7 +300,7 @@ def latest_firmware(
 
     return {
         "success": True,
-        "update_available": bool(latest and installed != latest),
+        "update_available": bool(latest and _version_tuple(latest) > _version_tuple(installed)),
         "current_version": installed,
         "latest_version": latest,
         "update_info": str(firmware.get("UpdateInfo") or ""),
@@ -851,3 +851,19 @@ def update_language_record(
     return {
         "success": True
     }
+
+def _version_tuple(version: str):
+    clean = version.strip().lstrip("vV")
+    parts = clean.split(".")
+    values = []
+
+    for part in parts:
+        try:
+            values.append(int(part))
+        except ValueError:
+            values.append(0)
+
+    while len(values) < 4:
+        values.append(0)
+
+    return tuple(values[:4])
