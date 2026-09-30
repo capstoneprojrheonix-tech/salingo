@@ -1198,6 +1198,15 @@ def synthesize_speech(text: str, language: str) -> dict:
             "message": "No text to speak.",
         }
 
+    if not language:
+        return {
+            "success": False,
+            "audio": b"",
+            "mime_type": "",
+            "sample_rate": 0,
+            "message": "No language selected.",
+        }
+
     if not ELEVENLABS_API_KEY:
         return {
             "success": False,
@@ -1266,16 +1275,23 @@ def synthesize_speech(text: str, language: str) -> dict:
         }
 
     if response.status_code >= 400:
+        detail = response.text[:300]
+
         return {
             "success": False,
             "audio": b"",
             "mime_type": "",
             "sample_rate": 0,
-            "message": (
-                f"ElevenLabs TTS failed "
-                f"({response.status_code}): "
-                f"{response.text[:300]}"
-            ),
+            "message": f"ElevenLabs TTS failed ({response.status_code}): {detail}",
+        }
+
+    if not response.content:
+        return {
+            "success": False,
+            "audio": b"",
+            "mime_type": "",
+            "sample_rate": 0,
+            "message": "ElevenLabs returned empty audio.",
         }
 
     return {
