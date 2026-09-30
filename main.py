@@ -361,6 +361,51 @@ def create_device_report(
         "report": rows[0] if rows else None,
     }
 
+@app.get("/api/device/notifications")
+def device_notifications(
+    device_id: str,
+    current_version: str = "",
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
+):
+    _require_device_auth(credentials)
+
+    device_id = device_id.strip()
+    installed = current_version.strip().lstrip("vV")
+
+    if not device_id:
+        raise HTTPException(400, "device_id is required")
+
+    firmware = _get_latest_firmware()
+    latest = ""
+
+    if firmware:
+        latest = str(firmware.get("VersionCode") or "").strip().lstrip("vV")
+
+    update_available = bool(
+        latest
+        and _version_tuple(latest) > _version_tuple(installed)
+    )
+
+    query = urllib.parse.urlencode({
+        "select": "ID",
+        "DeviceID": f"eq.{device_id}",
+        "Status": "eq.Pending",
+    })
+
+    pending_rows = _supabase_request(
+        "GET",
+        "deviceReports",
+        query=query,
+    )
+
+    return {
+        "success": True,
+        "new_update": update_available,
+        "current_version": installed,
+        "latest_version": latest,
+        "update_info": str(firmware.get("UpdateInfo") or "") if firmware else "",
+        "pending_reports": len(pending_rows or []),
+    }
 
 def _version_tuple(version: str):
     clean = version.strip().lstrip("vV")
