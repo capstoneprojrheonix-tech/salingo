@@ -164,7 +164,10 @@ def _get_latest_firmware():
         with urllib.request.urlopen(request, timeout=15) as response:
             rows = json.loads(response.read().decode("utf-8"))
     except Exception as e:
-        raise HTTPException(502, f"Could not read firmware information: {e}")
+        raise HTTPException(
+            502,
+            f"Could not read firmware information from {url}: {e}"
+        )
 
     if not rows:
         return None
