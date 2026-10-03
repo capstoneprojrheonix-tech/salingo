@@ -989,3 +989,99 @@ def update_language_record(
     return {
         "success": True
     }
+
+def _get_latest_translation_data():
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise HTTPException(
+            503,
+            "Supabase translation data service is not configured"
+        )
+
+    query = urllib.parse.urlencode({
+        "select": "ID,VersionCode,Status,UpdateInfo,FileUrl,FileSha256,FileSize",
+        "Status": "eq.Latest",
+        "order": "VersionCode.desc",
+        "limit": "1",
+    })
+
+    url = (
+        f"{SUPABASE_URL.rstrip('/')}"
+        f"/rest/v1/translationDataManagement?"
+        f"{query}"
+    )
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "apikey": SUPABASE_SECRET_KEY,
+            "Authorization":
+                f"Bearer {SUPABASE_SECRET_KEY}",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=15
+        ) as response:
+
+            rows = json.loads(
+                response.read().decode("utf-8")
+            )
+
+    except Exception as e:
+        raise HTTPException(
+            502,
+            f"Could not read translation data information: {e}"
+        )
+
+    if not rows:
+        return None
+
+    return rows[0]
+
+@app.get("/api/translation-data/latest")
+def latest_translation_data(
+    current_version: int = 0,
+    credentials: Optional[
+        HTTPAuthorizationCredentials
+    ] = Depends(device_security),
+):
+    _require_device_auth(credentials)
+
+    data = _get_latest_translation_data()
+
+    if data is None:
+        raise HTTPException(
+            404,
+            "No translation data release is available"
+        )
+
+    latest_version = int(
+        data.get("VersionCode") or 0
+    )
+
+    return {
+        "success": True,
+        "update_available":
+            latest_version > current_version,
+
+        "current_version":
+            current_version,
+
+        "latest_version":
+            latest_version,
+
+        "update_info":
+            str(data.get("UpdateInfo") or ""),
+
+        "file_url":
+            str(data.get("FileUrl") or ""),
+
+        "sha256":
+            str(data.get("FileSha256") or ""),
+
+        "file_size":
+            int(data.get("FileSize") or 0),
+    }
