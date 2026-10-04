@@ -33,6 +33,7 @@ from fastapi import (
     HTTPException,
     Response,
     Depends,
+    Query,
 )
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -990,12 +991,13 @@ def update_language_record(
         "success": True
     }
 
+# ============================================================
+# Translation dataset updates (separate from firmware OTA)
+# ============================================================
+
 def _get_latest_translation_data():
     if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
-        raise HTTPException(
-            503,
-            "Supabase translation data service is not configured"
-        )
+        raise HTTPException(503, "Supabase translation data service is not configured")
 
     query = urllib.parse.urlencode({
         "select": "ID,VersionCode,Status,UpdateInfo,FileUrl,FileSha256,FileSize",
@@ -1003,85 +1005,70 @@ def _get_latest_translation_data():
         "order": "VersionCode.desc",
         "limit": "1",
     })
-
-    url = (
-        f"{SUPABASE_URL.rstrip('/')}"
-        f"/rest/v1/translationDataManagement?"
-        f"{query}"
-    )
-
-    request = urllib.request.Request(
-        url,
-        headers={
-            "apikey": SUPABASE_SECRET_KEY,
-            "Authorization":
-                f"Bearer {SUPABASE_SECRET_KEY}",
-            "Accept": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=15
-        ) as response:
-
-            rows = json.loads(
-                response.read().decode("utf-8")
-            )
-
-    except Exception as e:
-        raise HTTPException(
-            502,
-            f"Could not read translation data information: {e}"
-        )
-
+    rows = _supabase_request("GET", "translationDataManagement", query)
+    if not isinstance(rows, list):
+        raise HTTPException(502, "Invalid translation release response from Supabase")
     if not rows:
         return None
-
+    if not isinstance(rows[0], dict):
+        raise HTTPException(502, "Invalid translation release record from Supabase")
     return rows[0]
+
+
+def _translation_release_positive_int(value, field):
+    # Accept integer database values and numeric strings, without truncating
+    # floats or silently treating missing metadata as zero.
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise HTTPException(502, f"Invalid translation release {field}")
+    text = str(value).strip()
+    if not text or not text.isascii() or not text.isdigit():
+        raise HTTPException(502, f"Invalid translation release {field}")
+    try:
+        number = int(text)
+    except ValueError:
+        raise HTTPException(502, f"Invalid translation release {field}")
+    if number <= 0:
+        raise HTTPException(502, f"Invalid translation release {field}")
+    return number
+
 
 @app.get("/api/translation-data/latest")
 def latest_translation_data(
-    current_version: int = 0,
-    credentials: Optional[
-        HTTPAuthorizationCredentials
-    ] = Depends(device_security),
+    current_version: int = Query(default=0, ge=0),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
 ):
     _require_device_auth(credentials)
-
     data = _get_latest_translation_data()
-
     if data is None:
-        raise HTTPException(
-            404,
-            "No translation data release is available"
-        )
+        raise HTTPException(404, "No translation data release is available")
 
-    latest_version = int(
-        data.get("VersionCode") or 0
-    )
+    latest_version = _translation_release_positive_int(data.get("VersionCode"), "VersionCode")
+    file_size = _translation_release_positive_int(data.get("FileSize"), "FileSize")
+    file_url = str(data.get("FileUrl") or "").strip()
+    sha256 = str(data.get("FileSha256") or "").strip().lower()
+    try:
+        parsed_url = urllib.parse.urlsplit(file_url)
+        valid_url = (
+            parsed_url.scheme == "https" and bool(parsed_url.hostname)
+            and parsed_url.username is None and parsed_url.password is None
+            and not any(char.isspace() for char in file_url)
+        )
+        # Accessing port also validates malformed ports in stored URLs.
+        parsed_url.port
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise HTTPException(502, "Translation release FileUrl must be a valid HTTPS URL")
+    if len(sha256) != 64 or any(char not in "0123456789abcdef" for char in sha256):
+        raise HTTPException(502, "Invalid translation release SHA-256")
 
     return {
         "success": True,
-        "update_available":
-            latest_version > current_version,
-
-        "current_version":
-            current_version,
-
-        "latest_version":
-            latest_version,
-
-        "update_info":
-            str(data.get("UpdateInfo") or ""),
-
-        "file_url":
-            str(data.get("FileUrl") or ""),
-
-        "sha256":
-            str(data.get("FileSha256") or ""),
-
-        "file_size":
-            int(data.get("FileSize") or 0),
+        "update_available": latest_version > current_version,
+        "current_version": current_version,
+        "latest_version": latest_version,
+        "update_info": str(data.get("UpdateInfo") or ""),
+        "file_url": file_url,
+        "sha256": sha256,
+        "file_size": file_size,
     }
