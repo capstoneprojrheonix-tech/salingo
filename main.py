@@ -19,6 +19,7 @@ import hmac
 import shutil
 import tempfile
 import json
+import re
 import urllib.parse
 import urllib.request
 
@@ -38,7 +39,7 @@ from fastapi import (
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, conint
 
 import translation_agent as agent
 
@@ -1072,3 +1073,55 @@ def latest_translation_data(
         "sha256": sha256,
         "file_size": file_size,
     }
+
+
+# Successful ESP32 translations, counted by target language.
+# Cumulative snapshots + atomic SQL MAX avoid double counting retries.
+TranslationCount = conint(strict=True, ge=0, le=4294967295)
+
+
+class DeviceTranslationCountsRequest(BaseModel):
+    device_id: str
+    installation_id: str
+    english: TranslationCount
+    tagalog: TranslationCount
+    kapampangan: TranslationCount
+
+
+@app.post("/api/device/translation-counts")
+def sync_device_translation_counts(
+    body: DeviceTranslationCountsRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
+):
+    _require_device_auth(credentials)
+    device_id = body.device_id.strip()
+    installation_id = body.installation_id.strip().lower()
+    if not re.fullmatch(r"SALINGO-[0-9A-Fa-f]{8}", device_id):
+        raise HTTPException(400, "Invalid SALINGO device ID")
+    if not re.fullmatch(r"[0-9a-f]{16}", installation_id):
+        raise HTTPException(400, "Invalid installation ID")
+    result = _supabase_request("POST", "rpc/salingo_sync_translation_counts", body={
+        "p_device_id": device_id.upper(),
+        "p_installation_id": installation_id,
+        "p_english": body.english,
+        "p_tagalog": body.tagalog,
+        "p_kapampangan": body.kapampangan,
+    })
+    if not isinstance(result, dict) or result.get("success") is not True:
+        raise HTTPException(502, "Translation count save was not confirmed")
+    return {"success": True}
+
+
+@app.get("/api/translation-stats/summary")
+def translation_stats_summary(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(device_security),
+):
+    _require_device_auth(credentials)
+    result = _supabase_request("POST", "rpc/salingo_translation_counts_summary", body={})
+    counts = result.get("counts") if isinstance(result, dict) else None
+    if not isinstance(counts, dict) or any(
+        type(counts.get(language)) is not int or counts[language] < 0
+        for language in ("english", "tagalog", "kapampangan")
+    ):
+        raise HTTPException(502, "Invalid translation counts response")
+    return {"success": True, "counts": counts, "total": sum(counts.values())}
