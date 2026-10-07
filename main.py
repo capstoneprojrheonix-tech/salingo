@@ -39,7 +39,7 @@ from fastapi import (
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, conint
+from pydantic import BaseModel, Field, conint
 
 import translation_agent as agent
 
@@ -73,12 +73,14 @@ class TranslateRequest(BaseModel):
 
 
 class DeviceRegisterRequest(BaseModel):
+    dataset_version: Optional[int] = Field(default=None, ge=0, le=2147483647)
     device_id: str
     mac_address: str
     firmware_version: str = "unknown"
 
 
 class DeviceHeartbeatRequest(BaseModel):
+    dataset_version: Optional[int] = Field(default=None, ge=0, le=2147483647)
     device_id: str
     mac_address: str = ""
     firmware_version: str = "unknown"
@@ -232,6 +234,48 @@ def health():
 # SALINGO physical device API
 # ============================================================
 
+def _save_device_dataset_version(device, body):
+    # Older firmware omits the field: preserve its last known version.
+    fields = getattr(body, "model_fields_set", None)
+    if fields is None:
+        fields = getattr(body, "__fields_set__", set())
+    if "dataset_version" not in fields:
+        return device
+    conn = agent._get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET dataset_version = %s WHERE device_id = %s RETURNING dataset_version",
+                (body.dataset_version, body.device_id.strip()),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError("Device record was not found")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {**device, "dataset_version": row[0]}
+
+
+def _attach_device_dataset_versions(devices):
+    if not devices:
+        return devices
+    conn = agent._get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT device_id, dataset_version FROM devices WHERE device_id = ANY(%s)",
+                ([device["device_id"] for device in devices],),
+            )
+            versions = dict(cur.fetchall())
+    finally:
+        conn.close()
+    return [{**device, "dataset_version": versions.get(device["device_id"])} for device in devices]
+
+
 @app.post("/api/device/register")
 def register_device(
     body: DeviceRegisterRequest,
@@ -258,6 +302,8 @@ def register_device(
             body.firmware_version.strip()
             or "unknown",
         )
+
+        device = _save_device_dataset_version(device, body)
 
     except Exception as e:
         raise HTTPException(
@@ -296,6 +342,8 @@ def device_heartbeat(
             battery_percent=body.battery_percent,
         )
 
+        device = _save_device_dataset_version(device, body)
+
     except Exception as e:
         raise HTTPException(
             500,
@@ -315,7 +363,7 @@ def list_devices(
     _require_device_auth(credentials)
 
     try:
-        devices = agent.db_list_devices()
+        devices = _attach_device_dataset_versions(agent.db_list_devices())
 
     except Exception as e:
         raise HTTPException(
