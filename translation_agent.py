@@ -40,17 +40,6 @@ load_dotenv()
 
 BASE_DIR = Path(__file__).parent
 
-# Translation memory (RAG embeddings) used to live on local disk under
-# BASE_DIR/vectorstores/<pair>/{embeddings.npy,metadata.json,info.json}.
-# That's what caused trained datasets to "disappear" after the Render
-# service slept/redeployed/restarted: Render's free-tier filesystem is
-# EPHEMERAL — a new container is spun up from the last deployed image on
-# every restart, so any files written to local disk after deploy (i.e.
-# every uploaded dataset) are wiped, exactly like the audio recordings
-# used to be before those were moved to Supabase's "recordingManagement"
-# table. Translation memory now lives in Supabase's "translationMemory"
-# table for the same reason — see salingo_supabase_migration.sql for the
-# CREATE TABLE statement.
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 
 
@@ -69,18 +58,6 @@ def _get_db_connection():
         )
     return psycopg2.connect(SUPABASE_DB_URL)
 
-
-# ---------------------------------------------------------------------
-# languageManagement table (admin dashboard rows) — Supabase-backed
-# ---------------------------------------------------------------------
-# This is separate from the RAG translation memory in vectorstores/.
-# It's the bookkeeping table languageManagement.php's dashboard reads
-# and writes: one row per "language added" action, tracking its display
-# name, a running translation-pair count, the uploaded filename, and an
-# Active/Inactive status. PHP on InfinityFree can't reach Supabase
-# directly (outbound DB ports are blocked there), so PHP calls these
-# through HTTP endpoints on this Python service instead — see main.py's
-# /language-records routes and ai_bridge.php's matching PHP functions.
 
 def db_insert_language_record(language_name: str, translation: int, file_name: str, status: str = "Active") -> int:
     """Insert a new languageManagement row. Returns the new row's ID."""
@@ -185,6 +162,8 @@ ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
 
 ELEVENLABS_VOICE_NAME = os.getenv("ELEVENLABS_VOICE_NAME", "Josh")
 ELEVENLABS_ENGLISH_VOICE_ID = os.getenv("ELEVENLABS_ENGLISH_VOICE_ID", "").strip()
+ELEVENLABS_TAGALOG_VOICE_ID = os.getenv("ELEVENLABS_TAGALOG_VOICE_ID", "").strip()
+ELEVENLABS_KAPAMPANGAN_VOICE_ID = os.getenv("ELEVENLABS_KAPAMPANGAN_VOICE_ID", "").strip()
 MAX_VOICE_CLONE_SAMPLES = 5
 
 _premade_voice_cache: dict[str, str] = {}
@@ -1036,6 +1015,9 @@ def invalidate_voice_cache(language: str):
 def _get_or_create_elevenlabs_voice(language: str) -> dict:
     """
     Returns {"voice_id": str} for a voice to speak `language` with:
+      - A configured language-specific Voice ID takes precedence over
+        recordings, cached clones and the stock voice. Voice API failures
+        are returned to the caller; they do not trigger a stock fallback.
       - If this language has recorded pronunciation samples, returns a
         cloned ElevenLabs voice built from them (reusing a cached voice_id
         if the sample set hasn't changed since it was last built).
@@ -1050,10 +1032,17 @@ def _get_or_create_elevenlabs_voice(language: str) -> dict:
         return {"error": "ELEVENLABS_API_KEY is not set on the server."}
 
     language_key = _slug(language)
-    
-    if language_key == "english" and ELEVENLABS_ENGLISH_VOICE_ID:
-        return {"voice_id": ELEVENLABS_ENGLISH_VOICE_ID}
-    
+    configured_voice_id = {
+        "english": ELEVENLABS_ENGLISH_VOICE_ID,
+        "tagalog": ELEVENLABS_TAGALOG_VOICE_ID,
+        "filipino": ELEVENLABS_TAGALOG_VOICE_ID,
+        "kapampangan": ELEVENLABS_KAPAMPANGAN_VOICE_ID,
+        "pampanga": ELEVENLABS_KAPAMPANGAN_VOICE_ID,
+        "pampangan": ELEVENLABS_KAPAMPANGAN_VOICE_ID,
+    }.get(language_key)
+    if configured_voice_id:
+        return {"voice_id": configured_voice_id}
+
     examples = _load_audio_examples(language, max_examples=MAX_VOICE_CLONE_SAMPLES)
 
     if not examples:
