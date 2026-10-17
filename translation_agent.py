@@ -176,37 +176,18 @@ def db_list_language_records() -> list[dict]:
 EMBEDDING_MODEL = "gemini-embedding-001"
 CHAT_MODEL = "gemini-3.5-flash-lite"
 EMBEDDING_BATCH_SIZE = 100
-MAX_AUDIO_EXAMPLES_PER_REQUEST = 5  # how many reference clips to feed Gemini per transcription
-MAX_AUDIO_SAMPLE_BYTES = 5 * 1024 * 1024  # 5 MB cap per training clip
+MAX_AUDIO_EXAMPLES_PER_REQUEST = 5
+MAX_AUDIO_SAMPLE_BYTES = 5 * 1024 * 1024
 
-# TTS (voice cloning + premade fallback) — speaks translated text using an
-# ElevenLabs voice cloned from that language's recorded pronunciation
-# samples (Supabase "recordingManagement" table), falling back to a
-# premade/stock voice (e.g. "Josh") if no samples have been recorded yet
-# for that language. Instant Voice Cloning REQUIRES an ElevenLabs paid
-# plan (Starter, ~$5/mo+) — it will fail with a "paid_plan_required" error
-# on a Free plan key, same as premade/library voices via the API also do.
-#
-# Why ElevenLabs instead of a self-hosted model (XTTS/Chatterbox/etc): those
-# all need several GB of RAM to load, which reliably OOM-crashes small hosts
-# (Render free/starter tier). ElevenLabs runs the model on their servers —
-# this backend just makes a couple of small HTTPS calls.
-#
-# NOTE: ElevenLabs has no official Kapampangan language support — the
-# cloned voice's timbre/accent comes from the reference recordings, but
-# pronunciation accuracy for Kapampangan text is best-effort from their
-# multilingual model, not guaranteed.
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
 ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1"
 ELEVENLABS_TTS_MODEL = "eleven_multilingual_v2"
-# Name of the premade ElevenLabs voice used as a FALLBACK for languages that
-# don't have any recorded pronunciation samples yet. Must match a voice name
-# visible under the account's Voice Library exactly (case-insensitive match,
-# with a "Name - Descriptor" suffix tolerated — see _get_premade_voice_id).
-ELEVENLABS_VOICE_NAME = os.getenv("ELEVENLABS_VOICE_NAME", "Josh")
-MAX_VOICE_CLONE_SAMPLES = 5  # how many stored clips to submit when (re)building a cloned voice
 
-_premade_voice_cache: dict[str, str] = {}  # voice_name (lowercased) -> voice_id, in-memory only
+ELEVENLABS_VOICE_NAME = os.getenv("ELEVENLABS_VOICE_NAME", "Josh")
+ELEVENLABS_ENGLISH_VOICE_ID = os.getenv("ELEVENLABS_ENGLISH_VOICE_ID", "").strip()
+MAX_VOICE_CLONE_SAMPLES = 5
+
+_premade_voice_cache: dict[str, str] = {}
 
 _client = None
 
@@ -1069,22 +1050,19 @@ def _get_or_create_elevenlabs_voice(language: str) -> dict:
         return {"error": "ELEVENLABS_API_KEY is not set on the server."}
 
     language_key = _slug(language)
+    
+    if language_key == "english" and ELEVENLABS_ENGLISH_VOICE_ID:
+    return {"voice_id": ELEVENLABS_ENGLISH_VOICE_ID}
+    
     examples = _load_audio_examples(language, max_examples=MAX_VOICE_CLONE_SAMPLES)
 
     if not examples:
-        # No pronunciation samples recorded for this language yet — use the
-        # premade fallback voice instead of failing.
         return _get_premade_voice_id()
 
     cached = _get_cached_voice_id(language_key)
     if cached and cached[1] == len(examples):
-        # Same sample count as last time this voice was built — reuse it.
         return {"voice_id": cached[0]}
 
-    # Sample set changed (or no cache yet) — (re)build the cloned voice.
-    # If we're replacing an old voice, delete it from ElevenLabs first so
-    # we don't silently accumulate orphaned voices against the account's
-    # voice-slot limit.
     if cached:
         try:
             requests.delete(
@@ -1093,7 +1071,7 @@ def _get_or_create_elevenlabs_voice(language: str) -> dict:
                 timeout=15,
             )
         except requests.RequestException:
-            pass  # best-effort cleanup; not fatal if it fails
+            pass
 
     files = [
         ("files", (f"sample_{i}.{ex['mime_type'].split('/')[-1] or 'webm'}", ex["data"], ex["mime_type"]))
